@@ -1,0 +1,37 @@
+[package]
+name = "starve-not"
+version = "0.1.0-alpha.1"
+edition = "2024"
+authors = ["Louis <836250617@qq.com>"]
+license = "MIT OR Apache-2.0"
+description = "Adaptive admission control for multi-stage pipelines: keep the bottleneck fed while bounding work in flight"
+repository = "https://github.com/kingwingfly/starve-not"
+documentation = "https://docs.rs/starve-not"
+readme = "README.md"
+keywords = ["concurrency", "backpressure", "pipeline", "semaphore", "admission"]
+categories = ["concurrency", "asynchronous"]
+
+[features]
+default = ["rt"]
+## Spawn the pacer on a tokio runtime (`Pacer::spawn`).
+rt = ["tokio/rt", "tokio/time"]
+## Log every pacer decision at `debug`.
+tracing = ["dep:tracing"]
+
+[dependencies]
+# 1.51.1: `Semaphore::forget_permits` no longer reopens a closed semaphore (tokio#8021)
+tokio = { version = "1.51.1", default-features = false, features = ["sync"] }
+parking_lot = "0.12"
+smallvec = "1"
+tracing = { version = "0.1", optional = true }
+bon = "3.10.1"
+
+[[example]]
+name = "pipeline"
+required-features = ["rt"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[package.metadata.docs.rs]
+all-features = true
