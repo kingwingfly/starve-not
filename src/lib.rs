@@ -17,7 +17,8 @@
 //!
 //! - A [`Gate`] sits at the start of the pipeline and lets items in. Each admitted item holds a
 //!   *permit*, and the gate has a *limit* on how many permits are out at once. The permits come
-//!   as a [`Ticket`], which travels with the item until it is done.
+//!   as a [`Ticket`], which travels with the item until it is done. Items of very different
+//!   cost can take more than one permit each (see [Weighted items](Gate#weighted-items)).
 //! - An [`IdleProbe`] on the bottleneck measures how long it sits waiting for input.
 //! - A [`Pacer`] looks at the gate and the probes every couple of seconds, asks a [`Policy`]
 //!   what the limit should be, and changes the gate's limit.
@@ -75,6 +76,50 @@
 //! // on shutdown: let nothing new in, then wait for the items already inside
 //! gate.close();
 //! gate.drained().await;
+//! # }
+//! ```
+//!
+//! # Several gates
+//!
+//! One gate limits the whole pipeline, but a single stage can have its own limit too. Say
+//! downloads should be limited on their own, because the storage server slows down when
+//! asked for too much at once. Create one gate for downloads and one for the whole pipeline,
+//! each with its own pacer and policy. An item holds a ticket from each: the download ticket
+//! goes back as soon as the download is done, the other one when the item is finished.
+//!
+//! Always take the tickets in the same order, outer gate first. The example also weighs items
+//! by size (see [Weighted items](Gate#weighted-items)), so the outer limit is in megabytes.
+//!
+//! ```no_run
+//! use starve_not::{Aimd, DrainBounded, Gate, IdleProbe, Pacer};
+//! # struct Item { id: u64, megabytes: usize }
+//! # async fn download(_: u64) -> Result<Vec<u8>, ()> { Ok(vec![]) }
+//!
+//! # #[cfg(feature = "rt")]
+//! # async fn run(items: Vec<Item>, device: IdleProbe) {
+//! // the whole pipeline, in megabytes: grows while the device waits for input
+//! let pipeline = Gate::new(1);
+//! let policy = DrainBounded::builder().floor(256).build();
+//! let _pacer = Pacer::builder(&pipeline, policy).probe(&device).build().spawn();
+//!
+//! // downloads at once, in items: backs off when downloads fail or get slow
+//! let downloads = Gate::new(1);
+//! let _download_pacer = Pacer::builder(&downloads, Aimd::builder().floor(4).build())
+//!     .build()
+//!     .spawn();
+//!
+//! for item in items {
+//!     let Ok(ticket) = pipeline.acquire_weighted(item.megabytes).await else { break };
+//!     let Ok(download_ticket) = downloads.acquire().await else { break };
+//!     match download(item.id).await {
+//!         Ok(bytes) => {
+//!             download_ticket.complete();
+//!             // ...send `bytes` and `ticket` on to the device, which completes `ticket`
+//!         }
+//!         // both go back without counting as done
+//!         Err(_) => drop((download_ticket, ticket)),
+//!     }
+//! }
 //! # }
 //! ```
 //!

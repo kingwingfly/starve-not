@@ -35,6 +35,15 @@ Three policies are included:
 
 You can also write your own by implementing `Policy`.
 
+Two more things you can do:
+
+- **Weigh items by cost.** If some items are much bigger than others, admit each with
+  `gate.acquire_weighted(size)`. The limit then caps total size (megabytes, say) instead of the
+  number of items.
+- **Use several gates.** For example, one gate caps downloads in progress, and another caps
+  everything in the pipeline. Each gets its own pacer and policy, and an item holds a ticket
+  from each.
+
 ## Example
 
 ```rust

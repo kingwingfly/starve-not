@@ -2,6 +2,8 @@
 
 use std::{
     fmt,
+    future::{Future, poll_fn},
+    pin::{Pin, pin},
     sync::{
         Arc,
         atomic::{
@@ -9,6 +11,7 @@ use std::{
             Ordering::{Relaxed, SeqCst},
         },
     },
+    task::Poll,
 };
 
 use tokio::sync::{Notify, Semaphore, TryAcquireError};
@@ -38,6 +41,21 @@ impl std::error::Error for Closed {}
 /// the number handed out is back under the new limit.
 ///
 /// Clones are cheap and all refer to the same gate, so pass one to every task that needs it.
+///
+/// # Weighted items
+///
+/// A permit doesn't have to mean one item. If items differ a lot in cost (small and large
+/// images, short and long documents), give each a *weight* in whatever unit fits, say
+/// megabytes, and admit it with [`acquire_weighted`](Self::acquire_weighted). An item of weight
+/// 5 then takes 5 permits, and the limit becomes a limit on total weight.
+///
+/// Everything else counts in the same unit: [`in_flight`](Self::in_flight) is the weight inside,
+/// and completing a ticket counts its weight as done. The policies work unchanged, since they
+/// only compare these numbers with each other. Their settings that are counts, like
+/// [`DrainBounded`](crate::DrainBounded)'s `floor`, are then in your unit too.
+///
+/// An item heavier than the whole limit would never fit. Instead it waits until nothing else
+/// is inside and then takes the whole limit, so it goes through alone.
 #[derive(Clone)]
 pub struct Gate {
     inner: Arc<Inner>,
@@ -59,6 +77,16 @@ struct Inner {
     released: AtomicU64,
     /// woken whenever `held` or `admitting` drops to zero
     drained: Notify,
+    /// woken whenever the limit shrinks, so weighted acquires can stop waiting for more
+    /// permits than the new limit has
+    shrunk: Notify,
+    /// twice the shrinks so far, plus one while a shrink is underway, so a weighted acquire can
+    /// tell its gathered permits predate one
+    shrinks: AtomicU64,
+    /// woken when the gate closes, for weighted acquires waiting for their turn
+    closed: Notify,
+    /// the weighted acquire whose turn it is to gather permits
+    weighted: tokio::sync::Mutex<()>,
 }
 
 impl Gate {
@@ -78,6 +106,10 @@ impl Gate {
                 completed: AtomicU64::new(0),
                 released: AtomicU64::new(0),
                 drained: Notify::new(),
+                shrunk: Notify::new(),
+                shrinks: AtomicU64::new(0),
+                closed: Notify::new(),
+                weighted: tokio::sync::Mutex::const_new(()),
             }),
         }
     }
@@ -104,6 +136,112 @@ impl Gate {
         Ok(self.ticket(permits))
     }
 
+    /// Wait until an item of the given `weight` fits, and get a ticket holding `weight`
+    /// permits. See [Weighted items](Self#weighted-items).
+    ///
+    /// Weighted items are let in one at a time, in the order they asked. While it waits, the
+    /// item at the front sets aside permits as they come free, so light items can't keep
+    /// overtaking it. Permits set aside count as [`in_flight`](Self::in_flight), since nobody
+    /// else can use them. If the limit is lowered meanwhile, the item gives back everything it
+    /// set aside and starts over, so it never gets in on permits the new limit doesn't allow.
+    ///
+    /// An item heavier than the limit gets a ticket for the whole limit instead, once nothing
+    /// else is inside. A `weight` of 0 counts as 1.
+    ///
+    /// Fails with [`Closed`] if the gate is closed, including while waiting.
+    pub async fn acquire_weighted(&self, weight: usize) -> Result<Ticket, Closed> {
+        let _admitting = Admitting::new(&self.inner);
+        let weight = weight.max(1);
+        // weighted acquires gather permits one at a time: two gathering at once could each set
+        // aside part of what the other needs, and both wait forever. An earlier one that stopped
+        // being polled keeps its turn, so waiting for ours must still notice the gate closing
+        let _turn = {
+            let mut closed = pin!(self.inner.closed.notified());
+            closed.as_mut().enable();
+            if self.is_closed() {
+                return Err(Closed);
+            }
+            first(pin!(self.inner.weighted.lock()), closed)
+                .await
+                .ok_or(Closed)?
+        };
+        let mut reserved = Reservation::new(self);
+        let mut seen = self.inner.shrinks.load(SeqCst);
+        loop {
+            // the limit before the shrink count: a shrink makes the count odd before it lowers
+            // the limit, so seeing a lowered limit means seeing its shrink
+            let limit = self.inner.limit.load(SeqCst);
+            let shrinks = self.inner.shrinks.load(SeqCst);
+            if shrinks != seen {
+                // what we gathered fit the old limit, not necessarily the new one: with other
+                // items inside it may be the gate's whole excess. Hand it all back, where it pays
+                // off the shrink first, and gather again from permits free under the new limit
+                seen = shrinks;
+                reserved.refund(reserved.permits);
+            }
+            if shrinks % 2 == 1 {
+                // a shrink is underway and hasn't recorded its debt yet: permits free now may be
+                // ones it is about to retire, so gather nothing until it is done
+                let mut shrunk = pin!(self.inner.shrunk.notified());
+                shrunk.as_mut().enable();
+                if self.inner.shrinks.load(SeqCst) == seen {
+                    shrunk.await;
+                }
+                continue;
+            }
+            // at a limit of 0 this waits for a permit that only comes once the limit grows
+            let target = weight.min(limit).max(1);
+            if reserved.permits >= target {
+                // only a growth changed `target` since we gathered, so we hold exactly it
+                return Ok(reserved.into_ticket());
+            }
+            let free = self.take_free(target - reserved.permits);
+            if free > 0 {
+                reserved.add(free);
+                continue;
+            }
+            let mut shrunk = pin!(self.inner.shrunk.notified());
+            shrunk.as_mut().enable();
+            // checked after `enable`, so a shrink in between still wakes us: after one we may
+            // hold permits that only our refund would free
+            if self.inner.shrinks.load(SeqCst) != seen {
+                continue;
+            }
+            // a single permit is never split, so cancelling this wait on a shrink hands at
+            // most one permit that should retire to another waiter, as cancelling any
+            // `acquire` does; returns later pay the retirement back
+            match first(pin!(self.inner.sem.acquire()), shrunk).await {
+                Some(Ok(permit)) => {
+                    permit.forget();
+                    reserved.add(1);
+                }
+                Some(Err(_)) => return Err(Closed),
+                None => {}
+            }
+        }
+    }
+
+    /// Like [`acquire_weighted`](Self::acquire_weighted), but never waits.
+    ///
+    /// Returns `None` if the item doesn't fit right now, another weighted item is waiting
+    /// ahead of it, or the gate is closed.
+    pub fn try_acquire_weighted(&self, weight: usize) -> Option<Ticket> {
+        let _admitting = Admitting::new(&self.inner);
+        let _turn = self.inner.weighted.try_lock().ok()?;
+        let shrinks = self.inner.shrinks.load(SeqCst);
+        // mid-shrink, free permits may be ones the shrink is about to retire
+        if shrinks % 2 == 1 {
+            return None;
+        }
+        let target = weight.max(1).min(self.limit()).max(1);
+        let mut reserved = Reservation::new(self);
+        reserved.add(self.take_free(target));
+        // not all of it free, or a shrink started meanwhile: dropping `reserved` hands back
+        // what it took
+        (reserved.permits == target && self.inner.shrinks.load(SeqCst) == shrinks)
+            .then(|| reserved.into_ticket())
+    }
+
     /// Like [`acquire_up_to`](Self::acquire_up_to), but never waits.
     ///
     /// Returns `None` if no permit is free right now, the gate is closed, or `max` is 0.
@@ -117,22 +255,24 @@ impl Gate {
 
     /// Forget up to `want` free permits and return how many.
     fn take_free(&self, want: usize) -> usize {
+        let mut taken = 0;
         loop {
+            // the semaphore hands out at most `u32::MAX` at once: take bigger amounts in chunks
             let n = self
                 .inner
                 .sem
                 .available_permits()
-                .min(want)
+                .min(want - taken)
                 .min(u32::MAX as usize);
             if n == 0 {
-                return 0;
+                return taken;
             }
             match self.inner.sem.try_acquire_many(n as u32) {
                 Ok(permit) => {
                     permit.forget();
-                    return n;
+                    taken += n;
                 }
-                Err(TryAcquireError::Closed) => return 0,
+                Err(TryAcquireError::Closed) => return taken,
                 // another acquirer took some in between; retry with what's left
                 Err(TryAcquireError::NoPermits) => {}
             }
@@ -156,6 +296,9 @@ impl Gate {
     }
 
     /// How many items are inside right now: permits handed out and not yet given back.
+    ///
+    /// This includes permits set aside by a [weighted](Self::acquire_weighted) item still
+    /// waiting to get in, since nobody else can use them either.
     pub fn in_flight(&self) -> usize {
         self.inner.held.load(Relaxed)
     }
@@ -167,6 +310,7 @@ impl Gate {
     /// undone.
     pub fn close(&self) {
         self.inner.sem.close();
+        self.inner.closed.notify_waiters();
     }
 
     /// Whether [`close`](Self::close) has been called.
@@ -198,7 +342,22 @@ impl Gate {
     /// retire as they return.
     pub(crate) fn resize(&self, target: usize) {
         let target = target.min(Semaphore::MAX_PERMITS);
-        let current = self.inner.limit.swap(target, Relaxed);
+        // the shrink count is odd while a shrink is underway and even once its limit and debt
+        // are recorded, so a weighted acquire never gathers permits a shrink is about to
+        // retire. It reads the limit, then the count: making the count odd before lowering the
+        // limit means one that sees the lower limit also sees the shrink. A pacer is the only
+        // caller, so the limit read here is normally the one the swap replaces; if not, the
+        // check after the swap still counts the shrink, and a needless count only costs a
+        // weighted acquire a refund
+        let started = target < self.inner.limit.load(SeqCst);
+        if started {
+            self.inner.shrinks.fetch_add(1, SeqCst);
+        }
+        let current = self.inner.limit.swap(target, SeqCst);
+        let shrinking = target < current;
+        if shrinking && !started {
+            self.inner.shrinks.fetch_add(1, SeqCst);
+        }
         if target > current {
             // pays off pending retirements before adding permits
             self.circulate(target - current);
@@ -211,6 +370,11 @@ impl Gate {
             self.inner.retiring.fetch_add(shrink, Relaxed);
             let forgotten = self.inner.sem.forget_permits(shrink);
             self.circulate(forgotten);
+        }
+        if started || shrinking {
+            // done: even again
+            self.inner.shrinks.fetch_add(1, SeqCst);
+            self.inner.shrunk.notify_waiters();
         }
     }
 
@@ -234,6 +398,14 @@ impl Gate {
             false => &self.inner.released,
         };
         counter.fetch_add(n as u64, Relaxed);
+        self.put_back(n);
+    }
+
+    /// Return `n` held permits without counting them as having left the pipeline.
+    fn put_back(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
         self.circulate(n);
         // `SeqCst` pairs with `Admitting::drop`: of the two last decrements, at least one sees
         // the other counter at 0, and only that one pays for waking `drained`
@@ -262,6 +434,54 @@ impl fmt::Debug for Gate {
             .field("closed", &self.is_closed())
             .finish()
     }
+}
+
+/// Permits a weighted acquire has gathered so far. They count as held, so the policy sees them
+/// and a shrink retires them when they come back; dropping it gives them back without counting
+/// them as having left the pipeline.
+struct Reservation<'a> {
+    gate: &'a Gate,
+    permits: usize,
+}
+
+impl<'a> Reservation<'a> {
+    fn new(gate: &'a Gate) -> Self {
+        Self { gate, permits: 0 }
+    }
+
+    fn add(&mut self, n: usize) {
+        self.gate.inner.held.fetch_add(n, SeqCst);
+        self.permits += n;
+    }
+
+    fn refund(&mut self, n: usize) {
+        self.permits -= n;
+        self.gate.put_back(n);
+    }
+
+    fn into_ticket(mut self) -> Ticket {
+        Ticket {
+            gate: self.gate.clone(),
+            permits: std::mem::take(&mut self.permits),
+        }
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.gate.put_back(self.permits);
+    }
+}
+
+/// Wait for `a`, or return `None` as soon as `b` completes first.
+async fn first<A: Future, B: Future>(mut a: Pin<&mut A>, mut b: Pin<&mut B>) -> Option<A::Output> {
+    poll_fn(|cx| {
+        if let Poll::Ready(out) = a.as_mut().poll(cx) {
+            return Poll::Ready(Some(out));
+        }
+        b.as_mut().poll(cx).map(|_| None)
+    })
+    .await
 }
 
 /// Counts an acquire as in progress until dropped, including when its future is cancelled.
