@@ -9,7 +9,7 @@
 //! - **At 40s** the device slows to 20ms per item. Now the work inside would take too long to
 //!   finish, so the limit comes down.
 //! - **At 60s** the gate closes and the program waits for the items inside. That should take
-//!   less than the policy's `max_drain`.
+//!   less than the policy's `drain_target`.
 //!
 //! ```sh
 //! cargo run --example pipeline
@@ -39,7 +39,7 @@ async fn main() {
     let device = IdleProbe::new();
     let policy = DrainBounded::builder()
         .floor(2 * BATCH)
-        .max_drain(Duration::from_secs(2))
+        .drain_target(Duration::from_secs(2))
         .build();
     let _pacer = Pacer::builder(&gate, policy)
         .probe(&device)

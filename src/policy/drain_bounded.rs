@@ -29,8 +29,8 @@ use crate::Sample;
 /// only queue up, and the time rises. When it passes the allowed bound, the policy lowers the
 /// limit to what can leave within the bound.
 ///
-/// **The bound** is the larger of [`max_drain`] and [`headroom`] times the fastest time
-/// observed. That way a pipeline that is slow by nature (say, 20 seconds per item) isn't
+/// **The bound** is the larger of [`drain_target`] and the fastest time observed times
+/// [`max_slowdown`]. That way a pipeline that is slow by nature (say, 20 seconds per item) isn't
 /// squeezed below what it needs. The fastest time slowly creeps up again, so a pipeline that
 /// becomes slower for good is eventually judged by its new speed.
 ///
@@ -40,8 +40,8 @@ use crate::Sample;
 ///
 /// [`starving`]: DrainBoundedBuilder::starving
 /// [`growth`]: DrainBoundedBuilder::growth
-/// [`max_drain`]: DrainBoundedBuilder::max_drain
-/// [`headroom`]: DrainBoundedBuilder::headroom
+/// [`drain_target`]: DrainBoundedBuilder::drain_target
+/// [`max_slowdown`]: DrainBoundedBuilder::max_slowdown
 /// [`max_settle`]: DrainBoundedBuilder::max_settle
 ///
 /// # Example
@@ -49,8 +49,8 @@ use crate::Sample;
 /// ```
 /// # use std::time::Duration;
 /// # use starve_not::DrainBounded;
-/// // never below two batches of 16, and shutdown should take about 5 seconds at most
-/// let policy = DrainBounded::builder().floor(32).max_drain(Duration::from_secs(5)).build();
+/// // never below two batches of 16, and aim for shutdown to take about 5 seconds
+/// let policy = DrainBounded::builder().floor(32).drain_target(Duration::from_secs(5)).build();
 /// ```
 ///
 /// # Diagnostics
@@ -86,7 +86,7 @@ impl DrainBounded {
         ///
         /// # Panics
         ///
-        /// If a setting is out of range: `floor` is 0, `headroom` is below 1, `growth` is 1
+        /// If a setting is out of range: `floor` is 0, `max_slowdown` is below 1, `growth` is 1
         /// or less, `smoothing` is 0 or above 1, `starving` is below 0 or 1 or more, or
         /// `fastest_decay` is below 1. Such values would quietly keep the limit from ever
         /// growing, or stick it at the floor.
@@ -105,19 +105,22 @@ impl DrainBounded {
         max: usize,
         /// The limit to start with. Default: `floor`. Kept between `floor` and `max`.
         initial: Option<usize>,
-        /// How long items may stay inside the pipeline, which is also about how long a clean
-        /// shutdown takes. Default: 10 seconds.
+        /// How long the policy aims for items to stay inside the pipeline, which is also about
+        /// how long a clean shutdown takes. Default: 10 seconds.
         ///
-        /// The policy always allows at least this much, even if items used to go through much
-        /// faster.
+        /// For most pipelines this works as a cap: the limit comes down whenever items would
+        /// take longer. The exception is a pipeline where items take longer than this even at
+        /// their fastest. Capping it here would starve the bottleneck, so the policy allows
+        /// [`max_slowdown`](Self::max_slowdown) times the fastest time observed instead.
         #[builder(default = Duration::from_secs(10))]
-        max_drain: Duration,
-        /// How much slower than the fastest observed time an item may get, as a multiple.
-        /// Default: 1.5. Must be at least 1.
+        drain_target: Duration,
+        /// How many times slower than their fastest observed time items may get before the
+        /// limit comes down. Default: 1.5, so items may take up to 50% longer. Must be at least 1.
         ///
-        /// Only matters for pipelines where items take longer than `max_drain` even at best.
+        /// Only matters for pipelines where items take longer than `drain_target` even at their
+        /// fastest.
         #[builder(default = 1.5)]
-        headroom: f64,
+        max_slowdown: f64,
         /// What the limit is multiplied by each time it grows. Default: 2. Must be above 1.
         #[builder(default = 2.0)]
         growth: f64,
@@ -147,7 +150,7 @@ impl DrainBounded {
         max_settle: Duration,
     ) -> Self {
         assert!(floor > 0, "floor must be at least 1");
-        assert!(headroom >= 1.0, "headroom must be at least 1");
+        assert!(max_slowdown >= 1.0, "max_slowdown must be at least 1");
         assert!(growth > 1.0, "growth must be above 1");
         assert!((0.0..1.0).contains(&starving), "starving must be in [0, 1)");
         assert!(
@@ -160,8 +163,8 @@ impl DrainBounded {
                 floor,
                 max: max.max(floor),
                 initial,
-                max_drain,
-                headroom,
+                drain_target,
+                max_slowdown,
                 growth,
                 smoothing,
                 starving,
@@ -232,7 +235,10 @@ impl Policy for DrainBounded {
         if self.saturated && self.residence > 0.0 && self.residence.is_finite() {
             self.fastest = self.fastest.min(self.residence);
         }
-        let drain_bound = c.max_drain.as_secs_f64().max(self.fastest * c.headroom);
+        let drain_bound = c
+            .drain_target
+            .as_secs_f64()
+            .max(self.fastest * c.max_slowdown);
 
         let target = if self.settle_until.is_some_and(|until| sample.at < until) {
             limit
@@ -278,8 +284,8 @@ struct Config {
     floor: usize,
     max: usize,
     initial: Option<usize>,
-    max_drain: Duration,
-    headroom: f64,
+    drain_target: Duration,
+    max_slowdown: f64,
     growth: f64,
     smoothing: f64,
     starving: f64,
