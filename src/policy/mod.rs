@@ -44,7 +44,7 @@ pub trait Policy: Send + 'static {
 ///
 /// Printing it gives `name=value` pairs separated by spaces.
 #[derive(Clone, Default, PartialEq)]
-pub struct Diagnostics(SmallVec<[(&'static str, f64); 6]>);
+pub struct Diagnostics(SmallVec<[(&'static str, f64); 8]>);
 
 impl Diagnostics {
     /// Add a value.
