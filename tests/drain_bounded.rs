@@ -361,8 +361,8 @@ fn early_stall_does_not_keep_growing() {
         }
         peak = peak.max(limit);
     }
-    // a completion counts for `max_window` (30s): room for two raises paced by the 8s it read
-    assert!(peak <= 16, "grew to {peak} on one completion");
+    // one raise at most: another needs a success after it
+    assert!(peak <= 8, "grew to {peak} on one completion");
     assert_eq!(limit, 4);
 }
 
@@ -397,4 +397,43 @@ fn startup_does_not_inflate_the_fastest_time() {
     // 1 item/s for at most 1.5 × the fastest time
     let limit = run.limit_at(1200.0);
     assert!(limit <= 400, "limit {limit}");
+}
+
+/// Upstream starts failing fast. Old successes must not keep authorising raises: failures are
+/// not a hungry bottleneck.
+#[test]
+fn does_not_grow_through_fast_failures() {
+    let mut pipeline = Pipeline::new(0.5..1.0, 120.0, 200.0);
+    pipeline.failing = Some(100.0..160.0);
+    let run = run(&pipeline, policy());
+    let before = run.limit_at(100.0);
+    let during = run.steps.iter().filter(|s| (100.0..160.0).contains(&s.t));
+    let peak = during.map(|s| s.target).max().unwrap();
+    assert!(
+        peak <= before * 2,
+        "grew from {before} to {peak} while failing"
+    );
+}
+
+/// One item leaves every 20 seconds, fewer than a window's worth. The policy must still learn
+/// the pace, so that when the bottleneck slows further the limit comes down.
+#[test]
+fn learns_the_pace_from_sparse_departures() {
+    let policy = DrainBounded::builder()
+        .floor(4)
+        .initial(64)
+        .drain_target(Duration::from_secs(10))
+        .build();
+    let mut pipeline = Pipeline::new(1.0..1.0, 0.05, 6000.0);
+    pipeline.rate.push((2000.0, 0.02));
+    let run = run(&pipeline, policy);
+    assert!(run.policy.fastest().is_some(), "never learned the pace");
+    // steady at about 64 (a few departures can trim it slightly while the window refills)
+    let before = run.limit_at(2000.0);
+    assert!(before >= 58, "limit {before} before the bottleneck slowed");
+    let after = run.limit_at(6000.0);
+    assert!(
+        after <= before * 3 / 4,
+        "limit {after} after the bottleneck slowed"
+    );
 }
