@@ -25,6 +25,12 @@ use parking_lot::Mutex;
 /// The [`Pacer`](crate::Pacer) reads the probe regularly. If the bottleneck waits for input
 /// while the gate is full, the pipeline doesn't let enough work in, and the limit should go up.
 ///
+/// The probe only sees the stage it is on. If a slower stage comes after it, with a buffer in
+/// between that holds more items than the gate lets in, this stage waits while that queue
+/// grows, and the probe reports hunger that more items won't fix. Put the probe on that slower
+/// stage instead, or keep the buffers after the probed stage small, so a slow stage behind it
+/// holds it up rather than leaving it idle.
+///
 /// When several workers run the same stage, give them clones of one probe. The stage counts as
 /// idle whenever at least one of them is waiting, since one worker with nothing to do is already
 /// wasted capacity.

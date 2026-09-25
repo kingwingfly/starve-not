@@ -17,41 +17,93 @@ use crate::Sample;
 /// the pacer, because the probe is how it learns that the bottleneck is waiting. Without one it
 /// never raises the limit.
 ///
+/// # What it controls
+///
+/// The gate only decides how many items are let in, so the limit only controls how fast
+/// upstream is fed. Everything from the bottleneck on runs at its own pace. The aim is that this
+/// part never waits for input, while the items inside can still finish in about
+/// [`drain_target`] on shutdown.
+///
+/// A ticket is held until its item is done, so the time an item spends after the bottleneck
+/// counts like any other. The probe on the bottleneck says when that part waits for input. If a
+/// slower stage sits behind the bottleneck with room for more items than the limit, the probe
+/// can't see its queue: see [Checking a raise](#checking-a-raise).
+///
 /// # How it decides
 ///
-/// **Residence** is how long an item stays in the pipeline: the average number of items inside
-/// divided by how many leave per second (Little's law). It is also about how long a clean
-/// shutdown takes. It is measured over a *window* of recent ticks that saw at least
-/// [`window_items`] items leave and covers one pass through the pipeline, or else spans
-/// [`max_window`]. A window at least one pass long sees a whole wave of departures, not just its
-/// crest or trough.
+/// ### Residence
 ///
-/// **Raising.** When the bottleneck waits for input ([`starving`]) while the gate is nearly
-/// full, the limit is multiplied by [`growth`]. Only if items have been succeeding: at least one
-/// since the last change, and at least half of those leaving lately. Otherwise items that fail
-/// fast, or hang, would look like a hungry bottleneck. After a raise, the next waits one pass (at
-/// most [`max_settle`]), until the new items have reached the bottleneck.
+/// How long an item stays in the pipeline: the average number of items inside divided by how
+/// many leave per second (Little's law). It is also about how long a clean shutdown takes.
 ///
-/// **Lowering.** Letting more in only makes items slower once the bottleneck is busy: then they
-/// queue, and residence rises. When it passes the *bound* while the bottleneck is busy, the limit
-/// is cut to what leaves within the bound. (While the bottleneck waits, nothing queues, and a cut
-/// would only starve it further.) When nothing has left for longer than [`max_window`] and twice
-/// the longest silence seen before, the pipeline is stuck: if the bottleneck waits, or no bound
-/// is known yet, the limit drops to [`floor`].
-/// After a cut, the next waits until the excess has left (at most [`max_settle`]).
+/// It is measured over a *window* of recent ticks that saw at least [`window_items`] items leave
+/// and covers one pass through the pipeline, or else spans [`max_window`]. A whole pass sees a
+/// whole wave of departures, not just its crest or trough.
 ///
-/// **The bound** is [`drain_target`], or [`max_slowdown`] times the *fastest* residence seen if
-/// that is longer, so a pipeline that is slow by nature isn't squeezed. Until the fastest time is
-/// known, only a stuck pipeline is cut: before, a long residence may just be the pipeline filling
-/// up. Right after a raise, the new items are inside but none has left yet, so residence reads
-/// high, by at most [`growth`]. The bound is widened by as much until they show up in the window.
+/// ### The bound
 ///
-/// **The fastest time** is learned from everything since the pipeline last settled (since the
-/// first items left, the limit last changed, or a raise's items came through), once at least
-/// [`window_items`] items have left in it. Queueing only adds
-/// to residence, so the lowest value seen is kept. It creeps up (by [`fastest_decay`]) only while
-/// the bottleneck waits, when nothing queues, so a slower upstream is eventually accepted but a
-/// slower bottleneck is not.
+/// The longest residence allowed: [`drain_target`], or [`max_slowdown`] times the *fastest*
+/// residence seen if that is longer, so a pipeline that is slow by nature isn't squeezed.
+///
+/// - Until the fastest time is known there is no bound, since a long residence may just be the
+///   pipeline filling up. Raises then stop at [`drain_target`] instead.
+/// - Right after a raise, the new items are inside but none has left yet, so residence reads
+///   high, by at most [`growth`]. The bound is widened by as much until they show up in the
+///   window.
+///
+/// ### The fastest time
+///
+/// Learned from everything since the pipeline last settled: since the first items left, the
+/// limit last changed (after a cut, once its excess has left), or a raise's items came
+/// through. It needs at least [`window_items`] items to have left, over at least one pass.
+///
+/// Queueing only adds to residence, so the lowest value seen is kept. It creeps up (by
+/// [`fastest_decay`]) only while the bottleneck waits, when nothing queues for it, so a slower
+/// upstream is eventually accepted but a slower bottleneck is not.
+///
+/// ### Raising
+///
+/// When the bottleneck waits for input ([`starving`]) while the gate is nearly full, the limit
+/// is multiplied by [`growth`]. Only if all of these hold:
+///
+/// - Residence is within the bound (or [`drain_target`] while no bound is known): more items
+///   can't make them leave sooner.
+/// - Items have been succeeding: at least one since the last change, and at least half of those
+///   leaving lately. Otherwise items that fail fast, or hang, would look like a hungry
+///   bottleneck.
+/// - The previous raise has shown: one pass has passed (at most [`max_settle`]), so its items
+///   have reached the bottleneck, and departures have risen as in the next section.
+///
+/// ### Checking a raise
+///
+/// A waiting bottleneck turns more items into more departures. Once a raise's items come
+/// through, departures should have risen by at least half as much as the limit did. If not,
+/// the part after the gate wasn't short of input: the items are queueing where no probe sees,
+/// such as behind the bottleneck.
+///
+/// If that raise also pushed residence past the bound, it is taken back. A raise that only
+/// failed to help but kept within the bound is left alone.
+///
+/// After taking a raise back, there is no other raise until the pace changes. Once the excess
+/// has left, the departures at the restored limit are measured over a stretch of at least
+/// [`window_items`] items and one pass. Each following stretch like it is compared with that,
+/// and one departing a quarter faster or slower lets raises try again. A cut starts the
+/// measuring over.
+///
+/// This needs to know when the raise's items come through, so it only checks raises made once
+/// the fastest time is known.
+///
+/// ### Lowering
+///
+/// Letting more in only makes items slower once the bottleneck is busy: then they queue in
+/// front of it, and residence rises. When residence passes the bound while the bottleneck is
+/// busy, the limit is cut to what leaves within the bound. While the bottleneck waits nothing
+/// queues for it, and a cut would only starve it further. After a cut, the next waits until the
+/// excess has left (at most [`max_settle`]).
+///
+/// When nothing has left for longer than [`max_window`] and twice the longest silence seen
+/// before, the pipeline is stuck. If the bottleneck waits, or no bound is known yet, the limit
+/// drops to [`floor`].
 ///
 /// [`floor`]: DrainBoundedBuilder::floor
 /// [`starving`]: DrainBoundedBuilder::starving
@@ -102,6 +154,8 @@ pub struct DrainBounded {
     pass: Option<Duration>,
     /// the raises whose items haven't reached the whole window yet
     ramp: Option<Ramp>,
+    /// set when a raise that brought no more departures was taken back
+    plateau: Option<Plateau>,
     /// no raise before this: the latest raise's items haven't reached the bottleneck
     raise_after: Option<Instant>,
     /// no cut before this: the latest cut's excess hasn't left
@@ -118,8 +172,34 @@ pub struct DrainBounded {
 struct Ramp {
     /// the limit before the first of these raises
     from: usize,
+    /// the limit before the latest raise
+    last: usize,
+    /// departures per second before the latest raise
+    departures: f64,
+    /// whether the pass was known at the latest raise; if not, the ramp may end before its
+    /// items come through, and it can't be checked
+    checked: bool,
     /// when the latest raise's items start leaving
     until: Instant,
+}
+
+impl Ramp {
+    /// Whether the latest raise brought more departures. A waiting bottleneck gets more work
+    /// from more items, so departures follow the limit; if they rose by less than half as much,
+    /// the items queue where no probe sees.
+    fn paid(&self, limit: usize, departures: f64) -> bool {
+        let raised = limit as f64 / self.last as f64;
+        departures >= self.departures * (1.0 + raised) / 2.0
+    }
+}
+
+/// A raise that brought no more departures was taken back: no raise until the pace changes.
+#[derive(Debug, Clone, Copy, Default)]
+struct Plateau {
+    /// departures per second at the restored limit, once measured
+    baseline: Option<f64>,
+    /// the stretch being measured: after the excess left, or after the last measurement
+    stretch: Tally,
 }
 
 /// What happened over some stretch of time. All integers, so adding and removing ticks is
@@ -157,6 +237,11 @@ impl Tally {
             (0, _) => f64::INFINITY,
             (departed, occupancy) => occupancy as f64 / 1e9 / departed as f64,
         }
+    }
+
+    /// Whether enough items left, over at least one pass, to trust its rates and residence.
+    fn measured(&self, items: u64) -> bool {
+        self.departed >= items && self.elapsed.as_secs_f64() >= self.residence()
     }
 
     /// Items finished per second.
@@ -327,6 +412,7 @@ impl DrainBounded {
             fastest: f64::INFINITY,
             pass: None,
             ramp: None,
+            plateau: None,
             raise_after: None,
             cut_after: None,
             residence: f64::INFINITY,
@@ -393,8 +479,12 @@ impl Policy for DrainBounded {
                 .pass
                 .map_or(c.max_window, |pass| pass.max(c.max_window));
             self.window.push(start, tick, c.window_items, min, max);
-            if self.filled {
+            // not while a cut's excess is still leaving: the pipeline hasn't settled yet
+            if self.filled && before <= limit && sample.in_flight <= limit {
                 self.settled.add(&tick);
+                if let Some(plateau) = &mut self.plateau {
+                    plateau.stretch.add(&tick);
+                }
             }
             // the first departures end the filling, which says nothing about the pace
             self.filled |= tick.departed > 0;
@@ -417,20 +507,37 @@ impl Policy for DrainBounded {
         }
 
         // 2. End the ramp once the window starts after the raised items began to leave.
+        let mut ended = None;
         if let (Some(ramp), Some(start)) = (self.ramp, self.window.start())
             && start >= ramp.until
         {
             self.ramp = None;
             self.settled = Tally::default();
+            ended = Some(ramp);
+        }
+        // On a plateau, measure the pace at the restored limit, then compare each following
+        // stretch with it. Once one differs by a quarter, a raise may help again.
+        if let Some(plateau) = &mut self.plateau
+            && plateau.stretch.measured(c.window_items)
+        {
+            let pace = plateau.stretch.departures();
+            plateau.stretch = Tally::default();
+            match plateau.baseline {
+                None => plateau.baseline = Some(pace),
+                Some(baseline) if !(baseline * 0.75..=baseline / 0.75).contains(&pace) => {
+                    self.plateau = None;
+                }
+                Some(_) => {}
+            }
         }
 
-        // 3. Learn the fastest time, from a full gate that isn't still shedding a cut's excess,
-        // and from enough items that mostly succeeded (fast failures aren't the pace).
+        // 3. Learn the fastest time, from a full gate, and from enough items over a whole pass
+        // that mostly succeeded (fast failures aren't the pace, and part of a pass may catch a
+        // burst).
         let settled = self.settled.residence();
         if self.saturated
-            && sample.in_flight <= limit
             && self.ramp.is_none()
-            && self.settled.departed >= c.window_items
+            && self.settled.measured(c.window_items)
             && self.settled.mostly_succeeded()
             && settled > 0.0
             && settled.is_finite()
@@ -447,9 +554,15 @@ impl Policy for DrainBounded {
             true => (self.fastest * c.max_slowdown).max(c.drain_target.as_secs_f64()),
             false => f64::INFINITY,
         };
-        self.bound = match self.ramp {
-            Some(ramp) => drain_bound * (limit as f64 / ramp.from as f64).clamp(1.0, c.growth),
-            None => drain_bound,
+        let widen = self.ramp.map_or(1.0, |ramp| {
+            (limit as f64 / ramp.from as f64).clamp(1.0, c.growth)
+        });
+        self.bound = drain_bound * widen;
+        // raising can't make items leave sooner: never past the bound, or past `drain_target`
+        // before the bound is known
+        let raise_bound = match drain_bound.is_finite() {
+            true => self.bound,
+            false => c.drain_target.as_secs_f64() * widen,
         };
         self.pass = match drain_bound.is_finite() {
             true => Duration::try_from_secs_f64(self.residence.min(drain_bound)).ok(),
@@ -466,9 +579,22 @@ impl Policy for DrainBounded {
             && silence > c.max_window.max(self.longest_silence.saturating_mul(2));
         let may_cut = self.cut_after.is_none_or(|after| sample.at >= after);
         let may_raise = self.raise_after.is_none_or(|after| sample.at >= after);
+        // a raise that brought no more departures and pushed residence past the bound only
+        // lengthened a hidden queue
+        let useless = ended.filter(|ramp| {
+            ramp.checked
+                && self.starving
+                && !ramp.paid(limit, departures)
+                && self.residence > raise_bound
+        });
+        if useless.is_some() {
+            self.plateau = Some(Plateau::default());
+        }
         let target = if stuck && (self.starving || drain_bound.is_infinite()) && may_cut {
             // nothing else would cut: the bound only acts on a busy bottleneck, once known
             0
+        } else if let Some(ramp) = useless {
+            ramp.last
         } else if self.residence > self.bound && !self.starving && may_cut {
             // keep what leaves within the bound. Not while the bottleneck waits: then nothing
             // queues, and a long residence is upstream latency, which a cut can't shorten.
@@ -477,6 +603,10 @@ impl Policy for DrainBounded {
         } else if self.starving
             && self.saturated
             && may_raise
+            && self.residence <= raise_bound
+            && self.plateau.is_none()
+            // raise again within a ramp only once the latest raise has paid
+            && self.ramp.is_none_or(|ramp| ramp.paid(limit, departures))
             && self.succeeded
             && window.mostly_succeeded()
         {
@@ -495,13 +625,22 @@ impl Policy for DrainBounded {
             // the new items reach the bottleneck, and start leaving, about one pass from now
             let pass = self.pass_estimate().unwrap_or(c.max_settle);
             self.raise_after = sample.at.checked_add(pass.min(c.max_settle));
+            // a raise within a ramp extends it
+            let from = self.ramp.map_or(limit, |ramp| ramp.from);
             self.ramp = sample.at.checked_add(pass).map(|until| Ramp {
-                from: self.ramp.map_or(limit, |ramp| ramp.from).max(1),
+                from: from.max(1),
+                last: limit.max(1),
+                departures,
+                checked: self.pass.is_some(),
                 until,
             });
         } else if target < limit {
             self.ramp = None;
             self.raise_after = None;
+            // the pace at the old limit no longer holds: measure it again
+            if self.plateau.is_some() {
+                self.plateau = Some(Plateau::default());
+            }
             // until the excess leaves at the current rate
             let hold = match sample.in_flight.saturating_sub(target) {
                 0 => Duration::ZERO,
