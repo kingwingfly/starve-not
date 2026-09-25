@@ -54,8 +54,8 @@ use crate::Sample;
 /// ### The fastest time
 ///
 /// Learned from everything since the pipeline last settled: since the first items left, the
-/// limit last changed, or a raise's items came through. It needs at least [`window_items`]
-/// items to have left, over at least one pass.
+/// limit last changed (after a cut, once its excess has left), or a raise's items came
+/// through. It needs at least [`window_items`] items to have left, over at least one pass.
 ///
 /// Queueing only adds to residence, so the lowest value seen is kept. It creeps up (by
 /// [`fastest_decay`]) only while the bottleneck waits, when nothing queues for it, so a slower
@@ -81,12 +81,17 @@ use crate::Sample;
 /// the part after the gate wasn't short of input: the items are queueing where no probe sees,
 /// such as behind the bottleneck.
 ///
-/// If that raise also pushed residence past the bound, it is taken back, and there is no other
-/// raise until departures change by a quarter or more. A raise that only failed to help but
-/// kept within the bound is left alone.
+/// If that raise also pushed residence past the bound, it is taken back. A raise that only
+/// failed to help but kept within the bound is left alone.
 ///
-/// This needs to know when the raise's items come through: once the fastest time is known, or
-/// while a pass is shorter than [`max_window`].
+/// After taking a raise back, there is no other raise until the pace changes. Once the excess
+/// has left, the departures at the restored limit are measured over a stretch of at least
+/// [`window_items`] items and one pass. Each following stretch like it is compared with that,
+/// and one departing a quarter faster or slower lets raises try again. A cut starts the
+/// measuring over.
+///
+/// This needs to know when the raise's items come through, so it only checks raises made once
+/// the fastest time is known.
 ///
 /// ### Lowering
 ///
@@ -149,9 +154,8 @@ pub struct DrainBounded {
     pass: Option<Duration>,
     /// the raises whose items haven't reached the whole window yet
     ramp: Option<Ramp>,
-    /// departures per second when a raise last failed to bring more; no raise until they
-    /// change
-    plateau: Option<f64>,
+    /// set when a raise that brought no more departures was taken back
+    plateau: Option<Plateau>,
     /// no raise before this: the latest raise's items haven't reached the bottleneck
     raise_after: Option<Instant>,
     /// no cut before this: the latest cut's excess hasn't left
@@ -172,9 +176,8 @@ struct Ramp {
     last: usize,
     /// departures per second before the latest raise
     departures: f64,
-    /// whether the pass was known at the latest raise, or at least not capped at
-    /// `max_window`; if not, the ramp may end before its items come through, and it can't be
-    /// checked
+    /// whether the pass was known at the latest raise; if not, the ramp may end before its
+    /// items come through, and it can't be checked
     checked: bool,
     /// when the latest raise's items start leaving
     until: Instant,
@@ -188,6 +191,15 @@ impl Ramp {
         let raised = limit as f64 / self.last as f64;
         departures >= self.departures * (1.0 + raised) / 2.0
     }
+}
+
+/// A raise that brought no more departures was taken back: no raise until the pace changes.
+#[derive(Debug, Clone, Copy, Default)]
+struct Plateau {
+    /// departures per second at the restored limit, once measured
+    baseline: Option<f64>,
+    /// the stretch being measured: after the excess left, or after the last measurement
+    stretch: Tally,
 }
 
 /// What happened over some stretch of time. All integers, so adding and removing ticks is
@@ -225,6 +237,11 @@ impl Tally {
             (0, _) => f64::INFINITY,
             (departed, occupancy) => occupancy as f64 / 1e9 / departed as f64,
         }
+    }
+
+    /// Whether enough items left, over at least one pass, to trust its rates and residence.
+    fn measured(&self, items: u64) -> bool {
+        self.departed >= items && self.elapsed.as_secs_f64() >= self.residence()
     }
 
     /// Items finished per second.
@@ -462,8 +479,12 @@ impl Policy for DrainBounded {
                 .pass
                 .map_or(c.max_window, |pass| pass.max(c.max_window));
             self.window.push(start, tick, c.window_items, min, max);
-            if self.filled {
+            // not while a cut's excess is still leaving: the pipeline hasn't settled yet
+            if self.filled && before <= limit && sample.in_flight <= limit {
                 self.settled.add(&tick);
+                if let Some(plateau) = &mut self.plateau {
+                    plateau.stretch.add(&tick);
+                }
             }
             // the first departures end the filling, which says nothing about the pace
             self.filled |= tick.departed > 0;
@@ -494,22 +515,29 @@ impl Policy for DrainBounded {
             self.settled = Tally::default();
             ended = Some(ramp);
         }
-        // the pace changed: a raise may help now
-        if let Some(plateau) = self.plateau
-            && !(plateau * 0.75..=plateau / 0.75).contains(&departures)
+        // On a plateau, measure the pace at the restored limit, then compare each following
+        // stretch with it. Once one differs by a quarter, a raise may help again.
+        if let Some(plateau) = &mut self.plateau
+            && plateau.stretch.measured(c.window_items)
         {
-            self.plateau = None;
+            let pace = plateau.stretch.departures();
+            plateau.stretch = Tally::default();
+            match plateau.baseline {
+                None => plateau.baseline = Some(pace),
+                Some(baseline) if !(baseline * 0.75..=baseline / 0.75).contains(&pace) => {
+                    self.plateau = None;
+                }
+                Some(_) => {}
+            }
         }
 
-        // 3. Learn the fastest time, from a full gate that isn't still shedding a cut's excess,
-        // and from enough items over a whole pass that mostly succeeded (fast failures aren't
-        // the pace, and part of a pass may catch a burst).
+        // 3. Learn the fastest time, from a full gate, and from enough items over a whole pass
+        // that mostly succeeded (fast failures aren't the pace, and part of a pass may catch a
+        // burst).
         let settled = self.settled.residence();
         if self.saturated
-            && sample.in_flight <= limit
             && self.ramp.is_none()
-            && self.settled.departed >= c.window_items
-            && self.settled.elapsed.as_secs_f64() >= settled
+            && self.settled.measured(c.window_items)
             && self.settled.mostly_succeeded()
             && settled > 0.0
             && settled.is_finite()
@@ -559,8 +587,8 @@ impl Policy for DrainBounded {
                 && !ramp.paid(limit, departures)
                 && self.residence > raise_bound
         });
-        if let Some(ramp) = useless {
-            self.plateau = Some(ramp.departures);
+        if useless.is_some() {
+            self.plateau = Some(Plateau::default());
         }
         let target = if stuck && (self.starving || drain_bound.is_infinite()) && may_cut {
             // nothing else would cut: the bound only acts on a busy bottleneck, once known
@@ -603,12 +631,16 @@ impl Policy for DrainBounded {
                 from: from.max(1),
                 last: limit.max(1),
                 departures,
-                checked: self.pass.is_some() || self.residence < c.max_window.as_secs_f64(),
+                checked: self.pass.is_some(),
                 until,
             });
         } else if target < limit {
             self.ramp = None;
             self.raise_after = None;
+            // the pace at the old limit no longer holds: measure it again
+            if self.plateau.is_some() {
+                self.plateau = Some(Plateau::default());
+            }
             // until the excess leaves at the current rate
             let hold = match sample.in_flight.saturating_sub(target) {
                 0 => Duration::ZERO,
