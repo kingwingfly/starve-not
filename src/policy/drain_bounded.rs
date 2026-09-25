@@ -26,8 +26,9 @@ const MIN_FASTEST_ITEMS: u64 = 4;
 /// **Raising.** If the bottleneck spent more than a little of the last tick waiting for input
 /// ([`starving`]), while the gate was nearly full, then not enough work is being let in to hide
 /// the upstream delay. The limit is multiplied by [`growth`] (doubled by default). Items must
-/// also have finished recently. Otherwise a failure where every item errors out quickly would
-/// look like a hungry bottleneck, and the limit would grow for nothing.
+/// also have finished recently (within [`max_window`], or one pass if that is longer).
+/// Otherwise a failure where every item errors out quickly, or hangs, would look like a hungry
+/// bottleneck, and the limit would grow for nothing.
 ///
 /// After a raise, the policy doesn't raise again until the items it let in have had time to
 /// reach the bottleneck (one pass through the pipeline, at most [`max_settle`]). Until they have,
@@ -38,7 +39,8 @@ const MIN_FASTEST_ITEMS: u64 = 4;
 /// clean shutdown would take. While the only problem is upstream delay, letting more in doesn't
 /// make items slower, so this time stays flat. Once the bottleneck has all it can handle, extra
 /// items only queue up, and the time rises. When it passes the allowed bound, the policy lowers
-/// the limit to what can leave within the bound.
+/// the limit to what can leave within the bound. If nothing at all leaves for a whole window,
+/// the pipeline is stuck, and the limit drops to [`floor`].
 ///
 /// Right after a raise, more items are inside but none of the new ones have come out yet, so
 /// items look slower than they are: about as many times as the limit grew in one pass, which is
@@ -47,11 +49,13 @@ const MIN_FASTEST_ITEMS: u64 = 4;
 ///
 /// **The bound** is the larger of [`drain_target`] and the fastest time observed times
 /// [`max_slowdown`]. That way a pipeline that is slow by nature (say, 20 seconds per item) isn't
-/// squeezed below what it needs. The fastest time is only measured while the bottleneck waits
-/// for input, since only then is it free of items queueing for the bottleneck. Each time, the
-/// remembered one creeps up a little, so a pipeline whose upstream becomes slower for good is
-/// eventually judged by its new speed. Until a fastest time is known, the limit isn't lowered
-/// while the bottleneck waits: long times then come from upstream, not from queueing.
+/// squeezed below what it needs. Queueing only ever adds to how long items take, so the policy
+/// keeps the shortest time it has measured while the gate was full, once the pipeline has
+/// filled up and settled after the last change. When measured while the bottleneck waits for
+/// input, which is when nothing queues for it, the remembered time also creeps up a little, so a
+/// pipeline whose upstream becomes slower for good is eventually judged by its new speed. Until
+/// a fastest time is known, the limit is only lowered when the pipeline is stuck: before that,
+/// long times may just be the pipeline filling up.
 ///
 /// **Measuring.** Rates are counted over the most recent ticks that together saw at least
 /// [`window_items`] items leave and cover one pass through the pipeline, or else span
@@ -63,6 +67,7 @@ const MIN_FASTEST_ITEMS: u64 = 4;
 /// **Waiting after lowering.** After lowering the limit, the policy waits until the items over
 /// the new limit have had time to leave (at most [`max_settle`]) before lowering it further.
 ///
+/// [`floor`]: DrainBoundedBuilder::floor
 /// [`starving`]: DrainBoundedBuilder::starving
 /// [`growth`]: DrainBoundedBuilder::growth
 /// [`drain_target`]: DrainBoundedBuilder::drain_target
@@ -94,9 +99,14 @@ pub struct DrainBounded {
     window: Window,
     /// items in flight at the previous sample, to average over the interval since
     last_in_flight: Option<usize>,
-    /// lowest residence in seconds observed while the bottleneck starved, slowly decayed to
-    /// follow lasting slowdowns upstream
+    /// lowest residence in seconds measured from a clean window, slowly decayed while the
+    /// bottleneck starves to follow lasting slowdowns upstream
     fastest: f64,
+    /// the end of the first tick in which items left: a window reaching back before it holds
+    /// the pipeline filling up, when everything is inside and nothing has come out
+    filled_at: Option<Instant>,
+    /// the end of the latest tick in which items completed
+    completed_at: Option<Instant>,
     /// when the limit last changed: a window reaching back before it mixes two limits
     changed_at: Option<Instant>,
     /// after a shrink, hold further shrinks until the excess has had time to leave
@@ -105,7 +115,8 @@ pub struct DrainBounded {
     ramp: Option<Ramp>,
     /// after a raise, hold the next one until the new items have reached the bottleneck
     raise_after: Option<Instant>,
-    /// seconds one pass through the pipeline takes, as of the previous decision
+    /// seconds one pass through the pipeline takes, as of the previous decision, once the
+    /// fastest time grounds it; `None` before, so a stall can't stretch it without end
     pass: Option<f64>,
     /// the latest decision's inputs, for diagnostics
     residence: f64,
@@ -300,6 +311,8 @@ impl DrainBounded {
             window: Window::default(),
             last_in_flight: None,
             fastest: f64::INFINITY,
+            filled_at: None,
+            completed_at: None,
             changed_at: None,
             settle_until: None,
             ramp: None,
@@ -322,8 +335,16 @@ impl DrainBounded {
         self.window.rate(self.window.departed)
     }
 
-    /// The shortest time an item took to go through the pipeline while the gate was full and
-    /// the bottleneck waited for input, slowly creeping up over time. `None` until one has been
+    /// Seconds one pass through the pipeline takes, as best known. Before the fastest time
+    /// grounds it, the latest residence measured, which is all startup has; a stall inflates
+    /// that, so it counts for at most `max_window`.
+    fn pass_estimate(&self) -> Option<f64> {
+        let measured = self.residence.min(self.config.max_window.as_secs_f64());
+        self.pass.or(Some(measured))
+    }
+
+    /// The shortest time an item took to go through the pipeline while the gate was full,
+    /// slowly creeping up while the bottleneck waits for input. `None` until one has been
     /// observed.
     pub fn fastest(&self) -> Option<Duration> {
         // can decay past what `Duration` holds
@@ -358,16 +379,18 @@ impl Policy for DrainBounded {
                 occupancy: (before + sample.in_flight) as f64 / 2.0 * sample.elapsed.as_secs_f64(),
             };
             // departures come in waves (a raise lets many in at once, which leave together one
-            // pass later), so a window shorter than a pass sees crests and troughs
-            let pass = self
-                .pass
-                .and_then(|pass| Duration::try_from_secs_f64(pass).ok());
-            let (min, max) = match pass {
-                Some(pass) => (pass, pass.max(c.max_window)),
-                None => (c.max_window, c.max_window),
-            };
+            // pass later), so a window shorter than a pass sees crests and troughs. It spans the
+            // estimated             // pass. Only a grounded pass may stretch it past `max_window`
+            let min = pass_duration(self.pass_estimate()).unwrap_or(c.max_window);
+            let max = pass_duration(self.pass).map_or(c.max_window, |pass| pass.max(c.max_window));
             self.window.push(tick, c.window_items, min, max);
             self.last_in_flight = Some(sample.in_flight);
+            if tick.departed > 0 && self.filled_at.is_none() {
+                self.filled_at = Some(sample.at);
+            }
+            if tick.completed > 0 {
+                self.completed_at = Some(sample.at);
+            }
         }
         let departures = self.departures();
         self.starving = sample.idle_shares().any(|share| share > c.starving);
@@ -386,35 +409,43 @@ impl Policy for DrainBounded {
         {
             self.ramp = None;
         }
-        // sample only while the bottleneck starves: otherwise residence includes items queueing
-        // for it, which is what the bound is there to limit. Only while the gate is full and not
-        // over it: a near-empty pipeline (no work, tail of a run) shows a short residence that
-        // says nothing about per-item latency, and one still retiring a shrink's permits is
-        // draining faster than it fills. Only from a window measured wholly since the last
-        // change, so it sees one limit, not the tail of another. Only from enough items, since
-        // the minimum of noise is too low. And only from items that mostly finished: when they
+        // measure only from a clean window. The gate full and not over it: a near-empty
+        // pipeline (no work, tail of a run) shows a short residence that says nothing about
+        // per-item latency, and one still retiring a shrink's permits is draining faster than
+        // it fills. Wholly after the pipeline first filled and after the last change, so it
+        // sees one limit in steady flow, not everything inside and nothing out yet. Enough
+        // items, since the minimum of noise is too low. And mostly finished items: when they
         // fail fast, residence is how long failing takes, not how long working does
+        let after =
+            |at: Option<Instant>| start.is_some_and(|start| at.is_some_and(|at| start >= at));
         let enough = self.window.departed >= c.window_items
             || (self.window.elapsed >= c.max_window && self.window.departed >= MIN_FASTEST_ITEMS);
-        if self.starving
-            && self.saturated
+        if self.saturated
             && sample.in_flight <= limit
             && self.ramp.is_none()
-            && start.is_some_and(|start| self.changed_at.is_none_or(|at| start >= at))
+            && after(self.filled_at)
+            && (self.changed_at.is_none() || after(self.changed_at))
             && enough
             && self.window.completed * 2 >= self.window.departed
             && self.residence > 0.0
             && self.residence.is_finite()
         {
-            self.fastest = (self.fastest * c.fastest_decay).min(self.residence);
+            // queueing only adds, so any clean reading may lower it. Only while the bottleneck
+            // starves, when nothing queues for it, may it creep up: otherwise a slowing
+            // bottleneck would drag the bound up with it
+            if self.starving {
+                self.fastest *= c.fastest_decay;
+            }
+            self.fastest = self.fastest.min(self.residence);
         }
-        let drain_target = c.drain_target.as_secs_f64();
-        let drain_bound = match (self.fastest.is_finite(), self.starving) {
-            (true, _) => drain_target.max(self.fastest * c.max_slowdown),
-            // no latency known yet, and the bottleneck waits: whatever is slow is upstream, and
-            // cutting the limit would starve it further
-            (false, true) => f64::INFINITY,
-            (false, false) => drain_target,
+        // no latency known yet: long times may be the pipeline filling up, so only a stall
+        // lowers the limit
+        let drain_bound = match self.fastest.is_finite() {
+            true => c
+                .drain_target
+                .as_secs_f64()
+                .max(self.fastest * c.max_slowdown),
+            false => f64::INFINITY,
         };
         // while raises ramp up, residence reads as many times high as the limit grew in one
         // pass: the window averages what was inside and what left over the same stretch, so
@@ -423,25 +454,41 @@ impl Policy for DrainBounded {
             Some(ramp) => drain_bound * (limit as f64 / ramp.from as f64).clamp(1.0, c.growth),
             None => drain_bound,
         };
-        self.pass = Some(self.residence.min(drain_bound)).filter(|pass| pass.is_finite());
+        // grounded in the fastest time: before it is known, a stall would stretch it without end
+        self.pass = drain_bound
+            .is_finite()
+            .then(|| self.residence.min(drain_bound));
+        // items went in, and have come out before, yet none left in a whole window
+        let stuck = self.filled_at.is_some()
+            && sample.in_flight > 0
+            && self.window.departed == 0
+            && self.window.elapsed >= c.max_window;
+        // how recent a completion must be to count: not tied to the window, which a stall
+        // could otherwise stretch to keep one old completion in it
+        let recent = c
+            .max_window
+            .max(pass_duration(self.pass).unwrap_or_default());
 
         let settling = self.settle_until.is_some_and(|until| sample.at < until);
-        let target = if self.residence > self.bound {
+        let target = if stuck || self.residence > self.bound {
             match settling {
                 // the latest shrink hasn't taken effect yet
                 true => limit,
                 // draining would take too long (or nothing leaves): keep what leaves in time.
                 // Never above the limit: while a shrink's permits still retire, more can be in
                 // flight than the limit allows, and this branch must not grow it
+                false if stuck => 0,
                 false => ((departures * drain_bound) as usize).min(limit),
             }
         } else if self.starving
             && self.saturated
             && self.raise_after.is_none_or(|after| sample.at >= after)
-            && self.window.completed > 0
+            && self
+                .completed_at
+                .is_some_and(|at| sample.at.saturating_duration_since(at) <= recent)
         {
             // the bottleneck waits while the gate is full; growth also needs items completing
-            // recently, or an outage (or startup) would grow it while every item fails
+            // recently, or an outage (or startup) would grow it while every item fails or hangs
             (limit as f64 * c.growth).ceil() as usize
         } else {
             limit
@@ -454,10 +501,7 @@ impl Policy for DrainBounded {
         if target > limit {
             // the new items reach the bottleneck, and start leaving, about one pass from now; a
             // pass that can't be told counts as `max_settle`
-            let pass = self
-                .pass
-                .and_then(|pass| Duration::try_from_secs_f64(pass).ok())
-                .unwrap_or(c.max_settle);
+            let pass = pass_duration(self.pass_estimate()).unwrap_or(c.max_settle);
             self.raise_after = sample.at.checked_add(pass.min(c.max_settle));
             self.ramp = sample.at.checked_add(pass).map(|until| Ramp {
                 from: self.ramp.map_or(limit, |ramp| ramp.from).max(1),
@@ -490,6 +534,10 @@ impl Policy for DrainBounded {
         d.push("saturated", f64::from(u8::from(self.saturated)));
         d
     }
+}
+
+fn pass_duration(pass: Option<f64>) -> Option<Duration> {
+    pass.and_then(|pass| Duration::try_from_secs_f64(pass).ok())
 }
 
 /// [`DrainBounded`]'s settings, as its builder set them.

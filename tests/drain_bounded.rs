@@ -340,3 +340,61 @@ fn does_not_grow_through_a_hang() {
         run.limit_at(160.0)
     );
 }
+
+/// Upstream stalls after a single item made it through, before any latency could be learned.
+/// That one old completion must not keep authorising raises, and the stall must bring the limit
+/// back down.
+#[test]
+fn early_stall_does_not_keep_growing() {
+    let mut policy = policy();
+    let origin = Instant::now();
+    let mut limit = policy.initial();
+    let tick = Duration::from_secs(2);
+    let mut peak = limit;
+    for i in 1..=300u32 {
+        let mut sample = Sample::new(origin + tick * i, tick, limit, limit);
+        sample.completed = u64::from(i == 1);
+        sample.idle.push(tick);
+        limit = policy.decide(&sample);
+        if std::env::var_os("SIM_TRACE").is_some() {
+            println!("{:6} limit={limit:<5} {}", i * 2, policy.diagnostics());
+        }
+        peak = peak.max(limit);
+    }
+    // a completion counts for `max_window` (30s): room for two raises paced by the 8s it read
+    assert!(peak <= 16, "grew to {peak} on one completion");
+    assert_eq!(limit, 4);
+}
+
+/// Starting high on a pipeline slower than `drain_target`, the fill transient (everything
+/// inside, nothing out yet) must not be taken for a pipeline that can't drain.
+#[test]
+fn startup_fill_is_not_taken_for_overload() {
+    let policy = DrainBounded::builder()
+        .floor(4)
+        .initial(512)
+        .drain_target(Duration::from_secs(10))
+        .build();
+    let run = run(&Pipeline::new(15.0..25.0, 20.0, 1200.0), policy);
+    // 20 items/s for 1200s, less the first pass
+    assert!(run.completed > 20_000, "only {} completed", run.completed);
+}
+
+/// A fastest time inflated by startup must not stick once the bottleneck is busy: when the
+/// bottleneck later slows, the limit still has to come down.
+#[test]
+fn startup_does_not_inflate_the_fastest_time() {
+    let policy = DrainBounded::builder()
+        .floor(4)
+        .initial(512)
+        .drain_target(Duration::from_secs(10))
+        .build();
+    let mut pipeline = Pipeline::new(35.0..45.0, 10.0, 1200.0);
+    pipeline.rate.push((400.0, 1.0));
+    let run = run(&pipeline, policy);
+    let fastest = run.policy.fastest().unwrap();
+    assert!(fastest < Duration::from_secs(200), "fastest {fastest:?}");
+    // 1 item/s for at most 1.5 × the fastest time
+    let limit = run.limit_at(1200.0);
+    assert!(limit <= 400, "limit {limit}");
+}

@@ -5,7 +5,7 @@
 //!
 //! - **Start:** downloads take 200ms and the device 5ms per item, in batches of 16.
 //! - **At 20s** downloads slow to 800ms. The device starts waiting for input, so the limit
-//!   doubles until the device is busy again.
+//!   doubles until the device is busy again, then settles back a bit.
 //! - **At 40s** the device slows to 20ms per item. Now the work inside would take too long to
 //!   finish, so the limit comes down.
 //! - **At 60s** the gate closes and the program waits for the items inside. That should take
