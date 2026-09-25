@@ -17,52 +17,88 @@ use crate::Sample;
 /// the pacer, because the probe is how it learns that the bottleneck is waiting. Without one it
 /// never raises the limit.
 ///
+/// # What it controls
+///
+/// The gate only decides how many items are let in, so the limit only controls how fast
+/// upstream is fed. Everything from the bottleneck on runs at its own pace. The aim is that this
+/// part never waits for input, while the items inside can still finish in about
+/// [`drain_target`] on shutdown.
+///
+/// A ticket is held until its item is done, so the time an item spends after the bottleneck
+/// counts like any other. The probe on the bottleneck says when that part waits for input. If a
+/// slower stage sits behind the bottleneck with room for more items than the limit, the probe
+/// can't see its queue: see [Checking a raise](#checking-a-raise).
+///
 /// # How it decides
 ///
-/// **Residence** is how long an item stays in the pipeline: the average number of items inside
-/// divided by how many leave per second (Little's law). It is also about how long a clean
-/// shutdown takes. It is measured over a *window* of recent ticks that saw at least
-/// [`window_items`] items leave and covers one pass through the pipeline, or else spans
-/// [`max_window`]. A window at least one pass long sees a whole wave of departures, not just its
-/// crest or trough.
+/// ### Residence
 ///
-/// **Raising.** When the bottleneck waits for input ([`starving`]) while the gate is nearly
-/// full, the limit is multiplied by [`growth`]. Only if items have been succeeding: at least one
-/// since the last change, and at least half of those leaving lately. Otherwise items that fail
-/// fast, or hang, would look like a hungry bottleneck. Never while residence is above the bound
-/// (or above [`drain_target`] while no bound is known): more items can't make them leave sooner.
-/// After a raise, the next waits one pass (at most [`max_settle`]), until the new items have
-/// reached the bottleneck, and until departures have risen as below.
+/// How long an item stays in the pipeline: the average number of items inside divided by how
+/// many leave per second (Little's law). It is also about how long a clean shutdown takes.
 ///
-/// **Checking a raise.** A waiting bottleneck gets more work from more items, so departures
-/// follow the limit. If, once the new items come through (known if a pass is shorter than
-/// [`max_window`] or the fastest time is known), departures haven't risen by at least half as
-/// much as the limit did in the latest raise, the items are queueing where no probe sees (say,
-/// after the bottleneck). If that pushed residence past the bound (or [`drain_target`]), the
-/// raise is taken back, and there is no other raise until departures change by a quarter or
-/// more.
+/// It is measured over a *window* of recent ticks that saw at least [`window_items`] items leave
+/// and covers one pass through the pipeline, or else spans [`max_window`]. A whole pass sees a
+/// whole wave of departures, not just its crest or trough.
 ///
-/// **Lowering.** Letting more in only makes items slower once the bottleneck is busy: then they
-/// queue, and residence rises. When it passes the *bound* while the bottleneck is busy, the limit
-/// is cut to what leaves within the bound. (While the bottleneck waits, nothing queues that a
-/// probe sees, and a cut would only starve it further; only a raise found useless is taken
-/// back.) When nothing has left for longer than [`max_window`] and twice the longest silence
-/// seen before, the pipeline is stuck: if the bottleneck waits, or no bound is known yet, the
-/// limit drops to [`floor`].
-/// After a cut, the next waits until the excess has left (at most [`max_settle`]).
+/// ### The bound
 ///
-/// **The bound** is [`drain_target`], or [`max_slowdown`] times the *fastest* residence seen if
-/// that is longer, so a pipeline that is slow by nature isn't squeezed. Until the fastest time is
-/// known, only a stuck pipeline is cut: before, a long residence may just be the pipeline filling
-/// up. Right after a raise, the new items are inside but none has left yet, so residence reads
-/// high, by at most [`growth`]. The bound is widened by as much until they show up in the window.
+/// The longest residence allowed: [`drain_target`], or [`max_slowdown`] times the *fastest*
+/// residence seen if that is longer, so a pipeline that is slow by nature isn't squeezed.
 ///
-/// **The fastest time** is learned from everything since the pipeline last settled (since the
-/// first items left, the limit last changed, or a raise's items came through), once at least
-/// [`window_items`] items have left in it and it spans a pass. Queueing only adds
-/// to residence, so the lowest value seen is kept. It creeps up (by [`fastest_decay`]) only while
-/// the bottleneck waits, when nothing queues, so a slower upstream is eventually accepted but a
-/// slower bottleneck is not.
+/// - Until the fastest time is known there is no bound, since a long residence may just be the
+///   pipeline filling up. Raises then stop at [`drain_target`] instead.
+/// - Right after a raise, the new items are inside but none has left yet, so residence reads
+///   high, by at most [`growth`]. The bound is widened by as much until they show up in the
+///   window.
+///
+/// ### The fastest time
+///
+/// Learned from everything since the pipeline last settled: since the first items left, the
+/// limit last changed, or a raise's items came through. It needs at least [`window_items`]
+/// items to have left, over at least one pass.
+///
+/// Queueing only adds to residence, so the lowest value seen is kept. It creeps up (by
+/// [`fastest_decay`]) only while the bottleneck waits, when nothing queues for it, so a slower
+/// upstream is eventually accepted but a slower bottleneck is not.
+///
+/// ### Raising
+///
+/// When the bottleneck waits for input ([`starving`]) while the gate is nearly full, the limit
+/// is multiplied by [`growth`]. Only if all of these hold:
+///
+/// - Residence is within the bound (or [`drain_target`] while no bound is known): more items
+///   can't make them leave sooner.
+/// - Items have been succeeding: at least one since the last change, and at least half of those
+///   leaving lately. Otherwise items that fail fast, or hang, would look like a hungry
+///   bottleneck.
+/// - The previous raise has shown: one pass has passed (at most [`max_settle`]), so its items
+///   have reached the bottleneck, and departures have risen as in the next section.
+///
+/// ### Checking a raise
+///
+/// A waiting bottleneck turns more items into more departures. Once a raise's items come
+/// through, departures should have risen by at least half as much as the limit did. If not,
+/// the part after the gate wasn't short of input: the items are queueing where no probe sees,
+/// such as behind the bottleneck.
+///
+/// If that raise also pushed residence past the bound, it is taken back, and there is no other
+/// raise until departures change by a quarter or more. A raise that only failed to help but
+/// kept within the bound is left alone.
+///
+/// This needs to know when the raise's items come through: once the fastest time is known, or
+/// while a pass is shorter than [`max_window`].
+///
+/// ### Lowering
+///
+/// Letting more in only makes items slower once the bottleneck is busy: then they queue in
+/// front of it, and residence rises. When residence passes the bound while the bottleneck is
+/// busy, the limit is cut to what leaves within the bound. While the bottleneck waits nothing
+/// queues for it, and a cut would only starve it further. After a cut, the next waits until the
+/// excess has left (at most [`max_settle`]).
+///
+/// When nothing has left for longer than [`max_window`] and twice the longest silence seen
+/// before, the pipeline is stuck. If the bottleneck waits, or no bound is known yet, the limit
+/// drops to [`floor`].
 ///
 /// [`floor`]: DrainBoundedBuilder::floor
 /// [`starving`]: DrainBoundedBuilder::starving
