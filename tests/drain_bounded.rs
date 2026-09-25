@@ -37,6 +37,9 @@ struct Pipeline {
     failing: Option<Range<f64>>,
     /// upstream hangs in this time range: nothing gets through until it ends
     hanging: Option<Range<f64>>,
+    /// items per second a stage after the bottleneck handles, one at a time; its queue is
+    /// unbounded and the probe doesn't see it
+    sink: Option<f64>,
     secs: f64,
 }
 
@@ -47,6 +50,7 @@ impl Pipeline {
             rate: vec![(0.0, rate)],
             failing: None,
             hanging: None,
+            sink: None,
             secs,
         }
     }
@@ -110,6 +114,9 @@ fn run(pipeline: &Pipeline, mut policy: DrainBounded) -> Run {
     let mut queue = 0usize;
     // the batch on the bottleneck and when it finishes
     let mut busy: Option<(f64, usize)> = None;
+    // items waiting for the sink, and when the one on it finishes
+    let mut sink_queue = 0usize;
+    let mut sink_busy: Option<f64> = None;
     let (mut completed, mut released, mut idle) = (0u64, 0u64, 0.0f64);
     let mut total = 0u64;
     let (mut t, mut last_tick) = (0.0f64, 0.0f64);
@@ -154,21 +161,39 @@ fn run(pipeline: &Pipeline, mut policy: DrainBounded) -> Run {
             queue -= n;
             busy = Some((t + n as f64 / pipeline.rate_at(t), n));
         }
+        if let Some(rate) = pipeline.sink
+            && sink_busy.is_none()
+            && sink_queue > 0
+        {
+            sink_queue -= 1;
+            sink_busy = Some(t + 1.0 / rate);
+        }
         let next_tick = last_tick + TICK;
         let next_upstream = upstream
             .peek()
             .map_or(f64::INFINITY, |Reverse((at, _))| *at as f64 / 1e6);
         let next_done = busy.map_or(f64::INFINITY, |(at, _)| at);
-        let next = next_tick.min(next_upstream).min(next_done);
+        let next_sink = sink_busy.unwrap_or(f64::INFINITY);
+        let next = next_tick.min(next_upstream).min(next_done).min(next_sink);
         if busy.is_none() {
             idle += next - t;
         }
         t = next;
         if next == next_done {
             let (_, n) = busy.take().unwrap();
-            completed += n as u64;
-            total += n as u64;
-            in_flight -= n;
+            match pipeline.sink {
+                Some(_) => sink_queue += n,
+                None => {
+                    completed += n as u64;
+                    total += n as u64;
+                    in_flight -= n;
+                }
+            }
+        } else if next == next_sink {
+            sink_busy = None;
+            completed += 1;
+            total += 1;
+            in_flight -= 1;
         } else if next == next_upstream {
             let Reverse((_, event)) = upstream.pop().unwrap();
             match event {
@@ -436,4 +461,56 @@ fn learns_the_pace_from_sparse_departures() {
         after <= before * 3 / 4,
         "limit {after} after the bottleneck slowed"
     );
+}
+
+/// Issue #4: the items queue after the bottleneck, where the probe can't see them. The
+/// bottleneck keeps waiting, but more items only lengthen the queue: the limit must come back
+/// to what drains within `drain_target`, or the floor if even that takes longer.
+#[test]
+fn does_not_grow_into_a_hidden_queue() {
+    for sink in [0.1, 0.15, 0.2, 0.5, 1.0, 5.0, 20.0] {
+        let mut pipeline = Pipeline::new(1.0..2.0, 120.0, 3000.0);
+        pipeline.sink = Some(sink);
+        let run = run(&pipeline, policy());
+        let end = run.limit_at(3000.0);
+        let last = run.steps.last().unwrap();
+        assert!(
+            last.residence <= 10.0 || end == 4,
+            "sink {sink}: limit {end}, {last:?}"
+        );
+        // one raise past it to find out that more doesn't help
+        let peak = run.steps.iter().map(|s| s.target).max().unwrap();
+        assert!(
+            peak <= end * 2,
+            "sink {sink}: grew to {peak}, ended at {end}"
+        );
+    }
+}
+
+/// Issue #4 as observed: every item waits ~30s upstream, so about 0.13 items/s leave at the
+/// floor. Raising does help here, but only once the pace is known: until then the limit must
+/// not grow past `drain_target`, and afterwards residence stays within the bound, so a shutdown
+/// drains in about the bound rather than minutes.
+#[test]
+fn learns_the_bound_at_low_rates() {
+    let run = run(&Pipeline::new(28.0..32.0, 120.0, 1200.0), policy());
+    let learned = run
+        .steps
+        .iter()
+        .find(|s| s.bound.is_finite())
+        .expect("bound never learned");
+    assert!(learned.t <= 300.0, "bound learned only at {}s", learned.t);
+    // no raise before it: 4 items for 30s is already past the 10s target
+    assert!(
+        run.steps
+            .iter()
+            .filter(|s| s.t < learned.t)
+            .all(|s| s.target == 4),
+        "grew before the bound was known"
+    );
+    let fastest = run.policy.fastest().unwrap().as_secs_f64();
+    assert!((25.0..=35.0).contains(&fastest), "fastest {fastest}");
+    let last = run.steps.last().unwrap();
+    assert!(last.residence <= last.bound, "{last:?}");
+    assert_eq!(run.limit_at(1200.0), 1024);
 }
