@@ -122,12 +122,13 @@ struct Ramp {
     until: Instant,
 }
 
-/// What happened over some stretch of time.
+/// What happened over some stretch of time. All integers, so adding and removing ticks is
+/// exact.
 #[derive(Debug, Clone, Copy, Default)]
 struct Tally {
     elapsed: Duration,
-    /// items inside, summed over time, in item-seconds
-    occupancy: f64,
+    /// items inside, summed over time, in item-nanoseconds
+    occupancy: u128,
     departed: u64,
     completed: u64,
 }
@@ -140,20 +141,37 @@ impl Tally {
         self.completed += other.completed;
     }
 
+    /// Remove a part of this tally, such as its oldest tick.
+    fn sub(&mut self, part: &Tally) {
+        self.elapsed -= part.elapsed;
+        self.occupancy -= part.occupancy;
+        self.departed -= part.departed;
+        self.completed -= part.completed;
+    }
+
     /// Seconds an item stays inside, by Little's law.
     fn residence(&self) -> f64 {
-        match (self.departed, self.occupancy > 0.0) {
+        match (self.departed, self.occupancy) {
             // nothing was inside: idle, not stuck
-            (_, false) => 0.0,
-            (0, true) => f64::INFINITY,
-            (departed, true) => self.occupancy / departed as f64,
+            (_, 0) => 0.0,
+            (0, _) => f64::INFINITY,
+            (departed, occupancy) => occupancy as f64 / 1e9 / departed as f64,
         }
     }
 
-    fn rate(&self, items: u64) -> f64 {
+    /// Items finished per second.
+    fn throughput(&self) -> f64 {
         match self.elapsed.is_zero() {
             true => 0.0,
-            false => items as f64 / self.elapsed.as_secs_f64(),
+            false => self.completed as f64 / self.elapsed.as_secs_f64(),
+        }
+    }
+
+    /// Items leaving per second, finished or not.
+    fn departures(&self) -> f64 {
+        match self.elapsed.is_zero() {
+            true => 0.0,
+            false => self.departed as f64 / self.elapsed.as_secs_f64(),
         }
     }
 
@@ -181,20 +199,14 @@ impl Window {
         // the back, so a dropped tick is never needed again
         while self.ticks.len() > 1 {
             let (_, oldest) = self.ticks[0];
-            let elapsed = self.total.elapsed - oldest.elapsed;
-            let departed = self.total.departed - oldest.departed;
-            let enough = departed >= items && elapsed >= min;
-            if !enough && elapsed < max {
+            let mut rest = self.total;
+            rest.sub(&oldest);
+            let enough = rest.departed >= items && rest.elapsed >= min;
+            if !enough && rest.elapsed < max {
                 break;
             }
             self.ticks.pop_front();
-            self.total.elapsed = elapsed;
-            self.total.departed = departed;
-        }
-        // the rest summed afresh: subtracting floats would drift over a long run
-        self.total = Tally::default();
-        for (_, tick) in &self.ticks {
-            self.total.add(tick);
+            self.total = rest;
         }
     }
 
@@ -326,7 +338,7 @@ impl DrainBounded {
 
     /// Items finished per second, averaged over recent ticks.
     pub fn throughput(&self) -> f64 {
-        self.window.total.rate(self.window.total.completed)
+        self.window.total.throughput()
     }
 
     /// The shortest time an item took to go through the pipeline while the gate was full,
@@ -365,10 +377,10 @@ impl Policy for DrainBounded {
         if !sample.elapsed.is_zero() {
             // only both ends are known: assume in flight changed evenly in between
             let before = self.last_in_flight.unwrap_or(sample.in_flight);
-            let average = (before + sample.in_flight) as f64 / 2.0;
+            let ends = before as u128 + sample.in_flight as u128;
             let tick = Tally {
                 elapsed: sample.elapsed,
-                occupancy: average * sample.elapsed.as_secs_f64(),
+                occupancy: ends * sample.elapsed.as_nanos() / 2,
                 departed: sample.completed + sample.released,
                 completed: sample.completed,
             };
@@ -395,7 +407,7 @@ impl Policy for DrainBounded {
             self.succeeded |= tick.completed > 0;
         }
         let window = self.window.total;
-        let departures = window.rate(window.departed);
+        let departures = window.departures();
         self.residence = window.residence();
         self.starving = sample.idle_shares().any(|share| share > c.starving);
         self.saturated = sample.in_flight as u128 * 10 >= limit as u128 * 9;
@@ -504,8 +516,8 @@ impl Policy for DrainBounded {
     fn diagnostics(&self) -> Diagnostics {
         let window = &self.window.total;
         let mut d = Diagnostics::default();
-        d.push("throughput", window.rate(window.completed));
-        d.push("departures", window.rate(window.departed));
+        d.push("throughput", window.throughput());
+        d.push("departures", window.departures());
         d.push("residence", self.residence);
         d.push("fastest", self.fastest);
         d.push("bound", self.bound);
