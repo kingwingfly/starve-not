@@ -7,7 +7,7 @@ use std::{
 
 use bon::bon;
 
-use crate::{Diagnostics, Gate, IdleProbe, Policy, Sample, sample::Sampler};
+use crate::{Gate, IdleProbe, Policy, Sample, sample::Sampler};
 
 type OnDecision<P> = Box<dyn FnMut(&Decision, &P) + Send>;
 
@@ -17,7 +17,7 @@ type OnDecision<P> = Box<dyn FnMut(&Decision, &P) + Send>;
 /// are inside and how long the bottleneck waited. It passes all that to the policy as a
 /// [`Sample`] and sets the gate's limit to the policy's answer.
 ///
-/// On tokio, [`spawn`](Self::spawn) runs this in the background. Elsewhere, call
+/// On tokio, `spawn` runs this in the background. Elsewhere, call
 /// [`step`](Self::step) on your own timer.
 pub struct Pacer<P: Policy> {
     gate: Gate,
@@ -62,7 +62,8 @@ impl<P: Policy> Pacer<P> {
         #[builder(default = Duration::from_secs(2))]
         tick: Duration,
         /// A function called after every decision, for example to log or export metrics. It
-        /// gets the [`Decision`] and the policy.
+        /// gets the [`Decision`] and the policy, which explains the decision with
+        /// `Policy::diagnostics` (needs the `diagnostics` feature).
         #[builder(with = |f: impl FnMut(&Decision, &P) + Send + 'static| Box::new(f) as OnDecision<P>)]
         on_decision: Option<OnDecision<P>>,
     ) -> Self {
@@ -85,9 +86,10 @@ impl<P: Policy> Pacer<P> {
 
     /// Run one tick by hand: look at the gate and probes, ask the policy, set the new limit.
     ///
-    /// Call it at regular intervals, passing the current time as `now`. Any clock works, as
-    /// long as every call uses the same one. (Probes still measure idle time on the system
-    /// clock.)
+    /// Call it at regular intervals, passing the current time as `now`, from the clock the
+    /// probes use: [`Instant::now`], or `tokio::time::Instant::now().into_std()` with the
+    /// `test-util` feature (see [`IdleProbe`]). To drive a policy on simulated time, build
+    /// [`Sample`]s yourself and call [`Policy::decide`].
     ///
     /// Returns `None` on the first call, which only records a starting point, and when `now`
     /// equals the previous call's, since no time has passed to judge.
@@ -99,19 +101,7 @@ impl<P: Policy> Pacer<P> {
             // what the gate applied, which caps what the policy asked for
             target: self.gate.limit(),
             sample,
-            diagnostics: self.policy.diagnostics(),
         };
-        #[cfg(feature = "tracing")]
-        tracing::debug!(
-            limit = decision.limit,
-            target = decision.target,
-            in_flight = decision.sample.in_flight,
-            completed = decision.sample.completed,
-            released = decision.sample.released,
-            idle = ?decision.sample.idle,
-            diagnostics = %decision.diagnostics,
-            "starve-not decision"
-        );
         if let Some(on_decision) = &mut self.on_decision {
             on_decision(&decision, &self.policy);
         }
@@ -121,8 +111,8 @@ impl<P: Policy> Pacer<P> {
     /// Run the pacer in the background on the current tokio runtime.
     ///
     /// It keeps running until the returned [`PacerHandle`] is dropped. Timing uses tokio's
-    /// clock, so it follows `tokio::time::pause` and `advance` in tests. [`IdleProbe`]s still
-    /// use the system clock.
+    /// clock, so it follows `tokio::time::pause` and `advance` in tests, and so do
+    /// [`IdleProbe`]s with the `test-util` feature.
     ///
     /// # Panics
     ///
@@ -174,6 +164,10 @@ impl<P: Policy, S: pacer_builder::State> PacerBuilder<'_, P, S> {
 }
 
 /// What the pacer decided on one tick, and why.
+///
+/// For the policy's own explanation, enable the `diagnostics` feature and call
+/// `Policy::diagnostics`, for example from [`on_decision`](PacerBuilder::on_decision), which
+/// also gets the policy.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Decision {
@@ -184,8 +178,6 @@ pub struct Decision {
     pub target: usize,
     /// The data the policy decided from.
     pub sample: Sample,
-    /// The policy's own explanation of the decision.
-    pub diagnostics: Diagnostics,
 }
 
 /// Keeps a [`spawn`](Pacer::spawn)ed pacer running.

@@ -69,8 +69,9 @@ gate.close();
 gate.drained().await;
 ```
 
-`cargo run --example pipeline` runs a simulated pipeline where downloads and then the device
-get slower, and prints each decision so you can watch the limit adjust.
+`cargo run --example pipeline --features diagnostics` runs a simulated pipeline where
+downloads and then the device get slower, and prints each decision so you can watch the limit
+adjust.
 
 ## Why not use …
 
@@ -84,7 +85,11 @@ get slower, and prints each decision so you can watch the limit adjust.
 
 - `rt` (on by default): adds `Pacer::spawn`, which runs the pacer as a tokio task. Without it,
   call `Pacer::step` yourself on a timer.
-- `tracing`: logs each of the pacer's decisions at the `debug` level.
+- `diagnostics`: adds `Policy::diagnostics`, the values a policy decided from, for logs and
+  metrics. Without it, policies keep nothing extra for them.
+- `test-util`: for tests with paused tokio time. Probes then follow `tokio::time::pause`, like a
+  spawned pacer. Turn it on in `[dev-dependencies]` only, since it costs a little on every
+  probe call.
 
 ## License
 

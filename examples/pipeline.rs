@@ -12,7 +12,7 @@
 //!   less than the policy's `drain_target`.
 //!
 //! ```sh
-//! cargo run --example pipeline
+//! cargo run --example pipeline --features diagnostics
 //! ```
 
 use std::{
@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use starve_not::{DrainBounded, Gate, IdleProbe, Pacer, Ticket};
+use starve_not::{DrainBounded, Gate, IdleProbe, Pacer, Policy, Ticket};
 use tokio::sync::mpsc;
 
 const BATCH: usize = 16;
@@ -51,9 +51,9 @@ async fn main() {
                 d.limit,
                 d.target,
                 d.sample.in_flight,
-                p.throughput(),
+                p.completion_rate(),
                 d.sample.idle_shares().next().unwrap_or(0.0) * 100.0,
-                d.diagnostics,
+                p.diagnostics(),
             )
         })
         .build()
@@ -100,7 +100,7 @@ async fn main() {
                 let per_item = Duration::from_millis(per_item_ms.load(Relaxed));
                 std::thread::sleep(per_item * batch.len() as u32);
                 for (id, ticket) in batch {
-                    // every 20th item fails: returned, but not counted as throughput
+                    // every 20th item fails: returned, but not counted as completed
                     match id % 20 {
                         0 => ticket.release(),
                         _ => ticket.complete(),

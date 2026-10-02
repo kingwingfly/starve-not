@@ -5,6 +5,12 @@ use crate::Sample;
 
 /// Keeps the limit at one number.
 ///
+/// ```text
+/// limit
+///  64 |-----------------------------------------
+///     +-----------------------------------------> time
+/// ```
+///
 /// Useful as a baseline when you want to know whether an adaptive policy actually helps. It also
 /// lets you watch a pipeline's samples through
 /// [`on_decision`](crate::PacerBuilder::on_decision) without the limit changing.

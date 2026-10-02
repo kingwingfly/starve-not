@@ -31,8 +31,8 @@ pub struct Sample {
     /// How long each probe was idle since the previous sample, in the order the probes were
     /// added to the pacer.
     ///
-    /// Probes always use the system clock. If the pacer runs on a different clock (for example
-    /// tokio's paused test clock), these times may not match [`elapsed`](Self::elapsed).
+    /// Probes measure on their own clock (see [`IdleProbe`]). If the pacer is stepped with a
+    /// different one, these times may not match [`elapsed`](Self::elapsed).
     pub idle: SmallVec<[Duration; 2]>,
     /// Items inside the pipeline when the sample was taken.
     pub in_flight: usize,
@@ -96,8 +96,7 @@ impl Sampler {
             at: now,
             completed: gate.completed(),
             released: gate.released(),
-            // probes run on the system clock whatever clock `now` comes from; totals from the
-            // same clock keep their deltas consistent
+            // probes keep their own clock, whatever `now` comes from
             idle: probes.iter().map(IdleProbe::total).collect(),
         };
         let Some(last) = &self.last else {
