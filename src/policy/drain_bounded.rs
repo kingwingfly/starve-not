@@ -127,7 +127,8 @@ use crate::Sample;
 ///                                                   | yes
 ///            departures fell? --------------------- yes -> take it back. Something else
 ///                                                   | no     changed, such as upstream
-///                                                   v        hanging: no new wait
+///                                                   |        hanging: raises wait only if
+///                                                   v        an earlier raise was useless
 ///                     take it back: items queue where no probe sees,
 ///                     such as behind the bottleneck. Raises wait
 /// ```
@@ -158,9 +159,9 @@ use crate::Sample;
 ///   change.
 ///
 /// The raise may have been judged wrongly, so the wait also ends after a while even if the pace
-/// stays the same: after 16 stretches, longer the more the pace varies by chance. Then one
-/// *retry* may go past the bound, to find out whether a raise helps now. A retry that is useless
-/// again is taken back, and the next wait is twice as long:
+/// stays the same: after 16 stretches, longer the more the pace varies by chance. However the
+/// wait ends, one *retry* may go past the bound, to find out whether a raise helps now. A retry
+/// that is useless again is taken back, and the next wait is twice as long:
 ///
 /// ```text
 /// limit      retry          retry                    retry
@@ -642,7 +643,7 @@ impl DrainBounded {
         /// first raises the fastest time by this factor, then lowers it to the measurement if
         /// that is faster. Only while the bottleneck waits: then nothing queues for it, so a
         /// longer time means upstream got slower, not that items queue. And not after a raise
-        /// that didn't help, until the pace changes: that raise showed items queue where no
+        /// that didn't help, until a raise helps again: that raise showed items queue where no
         /// probe sees.
         ///
         /// For example, if the fastest time is 20 seconds and items now take 30, it reaches 30
@@ -829,27 +830,22 @@ impl Policy for DrainBounded {
                 let threshold = (PACE_NOISE * chance).max(MIN_PACE_CHANGE.ln_1p());
                 // in wobbles, to learn the dispersion from once it is known to be chance
                 let gap = apart / wobble;
-                match (apart.abs() > threshold, useless.differing.take()) {
+                let is_apart = apart.abs() > threshold;
+                let earlier = useless.differing.take();
+                if is_apart && earlier.is_some_and(|earlier| (earlier.gap > 0.0) == (gap > 0.0)) {
                     // the second in a row to differ this way: not chance
-                    (true, Some(earlier)) if (earlier.gap > 0.0) == (gap > 0.0) => {
-                        self.useless_raise = None;
-                        self.is_retry_due = true;
+                    self.useless_raise = None;
+                    self.is_retry_due = true;
+                } else {
+                    // an earlier one that differed was chance
+                    if let Some(earlier) = earlier {
+                        useless.baseline.add(&earlier.stretch);
+                        self.pace_dispersion.add(earlier.gap);
                     }
-                    // the first to differ, or it differs the other way: wait for the next. An
-                    // earlier one that differed was chance
-                    (true, earlier) => {
-                        if let Some(earlier) = earlier {
-                            useless.baseline.add(&earlier.stretch);
-                            self.pace_dispersion.add(earlier.gap);
-                        }
+                    if is_apart {
+                        // the first to differ, or it differs the other way: wait for the next
                         useless.differing = Some(Differing { stretch, gap });
-                    }
-                    // the same pace: so was an earlier one that differed
-                    (false, earlier) => {
-                        if let Some(earlier) = earlier {
-                            useless.baseline.add(&earlier.stretch);
-                            self.pace_dispersion.add(earlier.gap);
-                        }
+                    } else {
                         useless.baseline.add(&stretch);
                         self.pace_dispersion.add(gap);
                     }

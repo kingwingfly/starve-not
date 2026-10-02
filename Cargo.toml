@@ -36,7 +36,7 @@ required-features = ["rt", "diagnostics"]
 # turns on `diagnostics` and `test-util` for tests and examples, so a plain `cargo test` runs
 # the simulations (which read diagnostics) and the paused-clock tests; dropped when publishing
 starve-not = { path = ".", default-features = false, features = ["diagnostics", "test-util"] }
-tokio ={ version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true
