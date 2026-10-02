@@ -1,12 +1,14 @@
 //! Measuring how long the bottleneck waits for input.
 
-use std::{
-    fmt,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{fmt, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
+// for tests, the clock of the runtime the probe was created in, so it follows
+// `tokio::time::pause` like a spawned pacer
+#[cfg(not(feature = "test-util"))]
+use std::time::Instant;
+#[cfg(feature = "test-util")]
+use tokio::time::Instant;
 
 /// Measures how long a stage spends waiting for input.
 ///
@@ -36,11 +38,21 @@ use parking_lot::Mutex;
 /// wasted capacity.
 ///
 /// Probes are cheap: each call takes a short lock, so they are fine in hot loops and on blocking
-/// threads. They measure time on the system clock.
-#[derive(Clone, Default)]
+/// threads.
+///
+/// They measure time on the system clock. For tests with paused tokio time, turn on the
+/// `test-util` feature in your dev-dependencies: probes then read the clock of the tokio runtime
+/// they were created in, from any thread, so they follow `tokio::time::pause` like a spawned
+/// pacer. A probe created outside any runtime then uses the clock of the runtime it is used in,
+/// or the system clock outside one. The feature costs a little on every call, so leave it out of
+/// normal builds.
+#[derive(Clone)]
 pub struct IdleProbe {
     /// one lock so a reading never counts a wait twice or goes backwards
     state: Arc<Mutex<State>>,
+    /// the runtime the probe was created in, whose clock it reads
+    #[cfg(feature = "test-util")]
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 #[derive(Debug, Default)]
@@ -53,10 +65,20 @@ struct State {
     waiting: usize,
 }
 
+impl Default for IdleProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IdleProbe {
     /// Create a probe with no idle time recorded yet.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            state: Arc::default(),
+            #[cfg(feature = "test-util")]
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        }
     }
 
     /// Count the stage as idle until the returned guard is dropped.
@@ -72,29 +94,47 @@ impl IdleProbe {
     pub fn start(&self) {
         let state = &mut *self.state.lock();
         state.waiting += 1;
-        state.since.get_or_insert_with(Instant::now);
+        state.since.get_or_insert_with(|| self.now());
     }
 
     /// Mark that a worker stopped waiting for input. Does nothing if no worker was waiting.
     pub fn end(&self) {
         let state = &mut *self.state.lock();
         state.waiting = state.waiting.saturating_sub(1);
-        if state.waiting == 0 {
-            state.total += state
-                .since
-                .take()
-                .map_or(Duration::ZERO, |since| since.elapsed());
+        if let (0, Some(since)) = (state.waiting, state.since) {
+            state.since = None;
+            state.total += self.now().saturating_duration_since(since);
         }
     }
 
     /// Total time the stage has been idle so far, including a wait still going on.
     pub fn total(&self) -> Duration {
-        let now = Instant::now();
+        let now = self.now();
         let state = self.state.lock();
         let current = state
             .since
             .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
         state.total + current
+    }
+
+    /// The time on the probe's clock.
+    fn now(&self) -> Instant {
+        #[cfg(feature = "test-util")]
+        {
+            // a thread that is shutting down can't ask tokio, which would panic: use the system
+            // clock there
+            let current = tokio::runtime::Handle::try_current();
+            if current.is_err_and(|e| e.is_thread_local_destroyed()) {
+                return Instant::from_std(std::time::Instant::now());
+            }
+            // read the clock of the runtime the probe was created in, from any thread, even one
+            // in another runtime
+            if let Some(runtime) = &self.runtime {
+                let _entered = runtime.enter();
+                return Instant::now();
+            }
+        }
+        Instant::now()
     }
 }
 

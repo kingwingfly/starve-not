@@ -1,6 +1,6 @@
 [package]
 name = "starve-not"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 edition = "2024"
 authors = ["Louis <836250617@qq.com>"]
 license = "MIT OR Apache-2.0"
@@ -15,23 +15,28 @@ categories = ["concurrency", "asynchronous"]
 default = ["rt"]
 ## Spawn the pacer on a tokio runtime (`Pacer::spawn`).
 rt = ["tokio/rt", "tokio/time"]
-## Log every pacer decision at `debug`.
-tracing = ["dep:tracing"]
+## Let policies explain their decisions (`Policy::diagnostics`).
+diagnostics = []
+## For tests: probes read the clock of the tokio runtime they were created in, so they follow
+## `tokio::time::pause` like a spawned pacer.
+test-util = ["rt", "tokio/test-util"]
 
 [dependencies]
-# 1.51.1: `Semaphore::forget_permits` no longer reopens a closed semaphore (tokio#8021)
-tokio = { version = "1.51.1", default-features = false, features = ["sync"] }
+tokio = { version = "1.53.1", default-features = false, features = ["sync"] }
 parking_lot = "0.12"
 smallvec = "1"
-tracing = { version = "0.1", optional = true }
-bon = "3.10.1"
+bon = "3.10.2"
 
 [[example]]
 name = "pipeline"
-required-features = ["rt"]
+required-features = ["rt", "diagnostics"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# turns on `diagnostics` for tests and examples, so a plain `cargo test` runs the simulations,
+# which read it; dropped when publishing. Not `test-util`, so tests run the probes' normal clock:
+# the paused-clock tests need `cargo test --features test-util` (or `--all-features`)
+starve-not = { path = ".", default-features = false, features = ["diagnostics"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true

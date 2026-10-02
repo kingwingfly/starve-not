@@ -4,34 +4,56 @@ use std::time::Duration;
 
 use bon::bon;
 
-use super::{Diagnostics, Policy};
+#[cfg(feature = "diagnostics")]
+use super::Diagnostics;
+use super::Policy;
 use crate::Sample;
 
-/// Raises the limit a little on every good tick, and cuts it by a percentage on every bad one.
+/// Raises the limit a little on every good tick, and cuts it by a share on every bad one.
 ///
-/// This is the classic rule TCP uses to share a network, known as AIMD (additive increase,
-/// multiplicative decrease). It doesn't need an [`IdleProbe`](crate::IdleProbe). It looks only
-/// at failures and at how long items take, so it suits pipelines with no single bottleneck.
+/// This is the classic rule TCP uses to share a network: additive increase, multiplicative
+/// decrease (AIMD). It needs no [`IdleProbe`](crate::IdleProbe). It looks only at failures and
+/// at how long items take, so it suits pipelines with no single bottleneck.
 ///
-/// # How it decides
+/// # Every tick
+///
+/// ```text
+/// bad tick? ----------------------------------------- yes -> limit x `backoff`
+///   | no
+/// items finished, and at least half the limit used? - yes -> limit + `increase`
+///   | no
+/// keep the limit
+/// ```
 ///
 /// A tick is **bad** if either:
 ///
 /// - more than [`tolerance`] of the items that left were released rather than completed
 ///   (failures, timeouts), or
 /// - items take longer than [`max_residence`] to go through the pipeline. This time is
-///   estimated as the number of items inside divided by how many leave per second. If nothing
-///   leaves at all, it's the time since items last left, counted across ticks, so a pipeline
-///   that is stuck counts as bad once it has been stuck for `max_residence`.
+///   estimated as the items inside divided by how many leave per second. If nothing leaves at
+///   all, it is the time since items last left, counted across ticks, so a pipeline that is
+///   stuck counts as bad once it has been stuck for `max_residence`.
 ///
-/// On a bad tick the limit is multiplied by [`backoff`]. On a good tick where items finished and
-/// at least half the limit is in use, [`increase`] is added. Otherwise the limit stays: with
-/// less than half in use more room wouldn't be used anyway, and with nothing finishing there's
-/// no sign that more work would get through.
+/// A good tick only raises the limit when it shows room for more: with less than half the limit
+/// in use, more room wouldn't be used, and with nothing finishing, there's no sign more work
+/// would get through.
 ///
-/// Since it can't see whether a bottleneck is waiting, it keeps pushing the limit up until
-/// something goes wrong, then backs off. The limit ends up going up and down in a sawtooth just
-/// below the point where trouble starts.
+/// It can't see whether a bottleneck waits, so it keeps pushing the limit up until something
+/// goes wrong, then backs off. The limit ends up in a sawtooth just below where trouble starts:
+///
+/// ```text
+/// limit
+///   trouble - - - - - - - - - - - - - - - - - - - - - - - -
+///                  /|          /|          /|
+///                /  |        /  |        /  |
+///              /    |      /    |      /    |
+///            /      |    /      |    /      |
+///          /        |  /        |  /        |  /
+///        /          |/          |/          |/
+///      /     slowly up: + `increase` on each good tick
+///    /       quickly down: x `backoff` on a bad one
+///   +-----------------------------------------------------> time
+/// ```
 ///
 /// [`tolerance`]: AimdBuilder::tolerance
 /// [`max_residence`]: AimdBuilder::max_residence
@@ -48,19 +70,28 @@ use crate::Sample;
 ///
 /// # Diagnostics
 ///
-/// Each decision reports `residence` (estimated seconds an item stays inside), `released_share`
-/// (the fraction of leaving items that were released), and `congested` and `in_use` (1 if the
-/// tick was bad, or at least half the limit was in use, else 0).
+/// With the `diagnostics` feature, each decision reports `residence` (estimated seconds an item
+/// stays inside), `released_share` (the fraction of leaving items that were released), and two
+/// flags that are 1 or 0: `is_congested` (the tick was bad) and `is_in_use` (at least half the
+/// limit was in use).
 #[derive(Debug, Clone)]
 pub struct Aimd {
     config: Config,
-    /// the latest decision's inputs, for diagnostics
-    residence: f64,
-    released_share: f64,
     /// time items have been inside with none leaving, across ticks
     stalled: Duration,
-    congested: bool,
-    in_use: bool,
+    /// the latest decision's inputs
+    #[cfg(feature = "diagnostics")]
+    inputs: Inputs,
+}
+
+/// What [`Aimd`] decided from, kept for its diagnostics.
+#[cfg(feature = "diagnostics")]
+#[derive(Debug, Clone, Default)]
+struct Inputs {
+    residence: f64,
+    released_share: f64,
+    is_congested: bool,
+    is_in_use: bool,
 }
 
 #[bon]
@@ -76,36 +107,36 @@ impl Aimd {
         /// `tolerance` is below 0 or 1 or more.
     }))]
     pub fn new(
-        /// The lowest the limit goes. Default: 1.
+        /// The lowest the limit goes. Must be at least 1.
         #[builder(default = 1)]
         floor: usize,
-        /// The highest the limit goes, as a safety cap on memory. Default: 1024.
+        /// The highest the limit goes.
         ///
-        /// If set below `floor`, `floor` is used.
-        #[builder(default = 1024)]
+        /// This policy keeps raising the limit until something goes wrong, so without a cap it can
+        /// grow very large before it does. Set this if memory needs a hard cap, for example a
+        /// number of items, or megabytes for weighted items. If set below `floor`, `floor` is used.
+        #[builder(default = usize::MAX)]
         max: usize,
-        /// The limit to start with. Default: `floor`. Kept between `floor` and `max`.
+        /// Starting limit, kept between `floor` and `max`. An unset value starts at `floor`.
         initial: Option<usize>,
-        /// How much the limit grows on each good tick. Default: 1.
+        /// How much the limit grows on each good tick. Must be at least 1.
         ///
-        /// The default grows slowly: with 2-second ticks, going from 10 to 100 takes three
-        /// minutes. Raise it if your pipeline needs hundreds of items inside.
+        /// An increase of 1 with 2-second ticks takes three minutes to grow from 10 to 100.
+        /// Use a larger increase if your pipeline needs hundreds of items inside.
         #[builder(default = 1)]
         increase: usize,
-        /// What the limit is multiplied by on a bad tick. Default: 0.9, a 10% cut.
+        /// What the limit is multiplied by on a bad tick.
         ///
         /// Must be strictly between 0 and 1.
         #[builder(default = 0.9)]
         backoff: f64,
         /// How long items may take to go through the pipeline before a tick counts as bad.
-        /// Default: 10 seconds.
         #[builder(default = Duration::from_secs(10))]
         max_residence: Duration,
         /// The fraction of items that may be released, rather than completed, on a good tick.
-        /// Default: 0, so any release makes the tick bad.
         ///
-        /// At least 0 and below 1. Raise it if some failures are normal, for example 0.05 to
-        /// allow 5%.
+        /// At least 0 and below 1. Zero makes any release count as a bad tick. Raise it if some
+        /// failures are normal, for example 0.05 to allow 5%.
         #[builder(default = 0.0)]
         tolerance: f64,
     ) -> Self {
@@ -126,11 +157,9 @@ impl Aimd {
                 max_residence,
                 tolerance,
             },
-            residence: 0.0,
-            released_share: 0.0,
             stalled: Duration::ZERO,
-            congested: false,
-            in_use: false,
+            #[cfg(feature = "diagnostics")]
+            inputs: Inputs::default(),
         }
     }
 }
@@ -155,11 +184,11 @@ impl Policy for Aimd {
             return limit;
         }
         let departed = sample.completed + sample.released;
-        self.released_share = match departed {
+        let released_share = match departed {
             0 => 0.0,
             departed => sample.released as f64 / departed as f64,
         };
-        self.residence = match (sample.in_flight, departed) {
+        let residence = match (sample.in_flight, departed) {
             (0, _) => {
                 self.stalled = Duration::ZERO;
                 0.0
@@ -176,18 +205,27 @@ impl Policy for Aimd {
                 in_flight as f64 * elapsed / departed as f64
             }
         };
-        self.congested =
-            self.released_share > c.tolerance || self.residence > c.max_residence.as_secs_f64();
-        self.in_use = sample.in_flight as u128 * 2 >= limit as u128;
+        let is_congested =
+            released_share > c.tolerance || residence > c.max_residence.as_secs_f64();
+        let is_in_use = sample.in_flight as u128 * 2 >= limit as u128;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.inputs = Inputs {
+                residence,
+                released_share,
+                is_congested,
+                is_in_use,
+            };
+        }
 
-        if self.congested {
+        if is_congested {
             // while a previous cut's permits still retire, what's in flight reflects the old
             // limit: cutting again would count the same congestion twice
             if sample.in_flight > limit {
                 return limit.clamp(c.floor, c.max);
             }
             ((limit as f64 * c.backoff) as usize).clamp(c.floor, c.max)
-        } else if self.in_use && sample.completed > 0 {
+        } else if is_in_use && sample.completed > 0 {
             // growth needs items finishing now: a tick where nothing left (the start of a
             // stall) or everything failed within `tolerance` is no evidence of room
             limit.saturating_add(c.increase).clamp(c.floor, c.max)
@@ -196,12 +234,14 @@ impl Policy for Aimd {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
     fn diagnostics(&self) -> Diagnostics {
+        let i = &self.inputs;
         let mut d = Diagnostics::default();
-        d.push("residence", self.residence);
-        d.push("released_share", self.released_share);
-        d.push("congested", f64::from(u8::from(self.congested)));
-        d.push("in_use", f64::from(u8::from(self.in_use)));
+        d.push("residence", i.residence);
+        d.push("released_share", i.released_share);
+        d.push_flag("is_congested", i.is_congested);
+        d.push_flag("is_in_use", i.is_in_use);
         d
     }
 }

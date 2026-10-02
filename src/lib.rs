@@ -1,13 +1,12 @@
 //! Keep the slowest stage of a pipeline busy without letting work pile up.
 //!
 //! Picture a pipeline where items are downloaded, then processed on a GPU. The GPU is the
-//! expensive part, the *bottleneck*, and the whole pipeline goes only as fast as it does. You
-//! want two things:
+//! *bottleneck*, and the whole pipeline goes only as fast as it does. You want two things:
 //!
-//! 1. **The GPU never waits for input.** Enough items must be on their way to cover the time
-//!    downloads take, even when downloads suddenly get slower.
+//! 1. **The GPU never starves.** Enough items must be on their way to cover the time downloads
+//!    take, even when downloads suddenly get slower.
 //! 2. **Not too much is on its way.** Every item admitted into the pipeline uses memory, and on
-//!    shutdown you have to wait for all of them to finish. That wait should stay short.
+//!    shutdown it costs time for all of them to finish. That should stay short.
 //!
 //! No single fixed number gets both right, because the right number depends on download speed,
 //! GPU speed and batch size, and those change while the program runs. `starve-not` adjusts the
@@ -25,8 +24,10 @@
 //!
 //! Three policies come with the crate:
 //!
-//! - [`DrainBounded`] (the one to start with) raises the limit while the bottleneck waits for
-//!   input, and lowers it when the work already admitted would take too long to finish.
+//! - [`DrainBounded`] (the one to start with) raises the limit while the bottleneck starves and
+//!   the gate is nearly full, provided items are succeeding. It checks whether raises improve
+//!   throughput and uses estimated average residence to limit queued work, allowing longer for
+//!   naturally slow pipelines.
 //! - [`Aimd`] raises the limit slowly and cuts it when items fail or get slow. It needs no probe,
 //!   so it suits pipelines without one clear bottleneck.
 //! - [`Fixed`] never changes the limit. It is useful as a baseline when measuring the others.
@@ -83,12 +84,14 @@
 //!
 //! One gate limits the whole pipeline, but a single stage can have its own limit too. Say
 //! downloads should be limited on their own, because the storage server slows down when
-//! asked for too much at once. Create one gate for downloads and one for the whole pipeline,
-//! each with its own pacer and policy. An item holds a ticket from each: the download ticket
-//! goes back as soon as the download is done, the other one when the item is finished.
+//! asked for too many bytes at once. Create one gate for downloads and one for the whole
+//! pipeline, each with its own pacer and policy. An item holds a ticket from each: the download
+//! ticket goes back as soon as the download is done, the other one when the item is finished.
 //!
-//! Always take the tickets in the same order, outer gate first. The example also weighs items
-//! by size (see [Weighted items](Gate#weighted-items)), so the outer limit is in megabytes.
+//! Always take the tickets in the same order, outer gate first. Each gate can count in its own
+//! unit. Here images are resized to the same size once downloaded, so the pipeline counts items,
+//! but downloads differ in size, so the download gate weighs them in megabytes (see
+//! [Weighted items](Gate#weighted-items)).
 //!
 //! ```no_run
 //! use starve_not::{Aimd, DrainBounded, Gate, IdleProbe, Pacer};
@@ -97,20 +100,19 @@
 //!
 //! # #[cfg(feature = "rt")]
 //! # async fn run(items: Vec<Item>, device: IdleProbe) {
-//! // the whole pipeline, in megabytes: grows while the device waits for input
+//! // the whole pipeline, in items: grows while the device waits for input
 //! let pipeline = Gate::new(1);
-//! let policy = DrainBounded::builder().floor(256).build();
+//! let policy = DrainBounded::builder().floor(8).build();
 //! let _pacer = Pacer::builder(&pipeline, policy).probe(&device).build().spawn();
 //!
-//! // downloads at once, in items: backs off when downloads fail or get slow
+//! // downloads at once, in megabytes: backs off when downloads fail or get slow
 //! let downloads = Gate::new(1);
-//! let _download_pacer = Pacer::builder(&downloads, Aimd::builder().floor(4).build())
-//!     .build()
-//!     .spawn();
+//! let policy = Aimd::builder().floor(64).increase(16).build();
+//! let _download_pacer = Pacer::builder(&downloads, policy).build().spawn();
 //!
 //! for item in items {
-//!     let Ok(ticket) = pipeline.acquire_weighted(item.megabytes).await else { break };
-//!     let Ok(download_ticket) = downloads.acquire().await else { break };
+//!     let Ok(ticket) = pipeline.acquire().await else { break };
+//!     let Ok(download_ticket) = downloads.acquire_weighted(item.megabytes).await else { break };
 //!     match download(item.id).await {
 //!         Ok(bytes) => {
 //!             download_ticket.complete();
@@ -125,9 +127,13 @@
 //!
 //! # Features
 //!
-//! - `rt` (on by default): adds [`Pacer::spawn`], which runs the pacer as a tokio task. Without
+//! - `rt` (on by default): adds `Pacer::spawn`, which runs the pacer as a tokio task. Without
 //!   it, call [`Pacer::step`] yourself on a timer.
-//! - `tracing`: logs each of the pacer's decisions at the `debug` level.
+//! - `diagnostics`: adds `Policy::diagnostics`, the values a policy decided from, for logs and
+//!   metrics. Without it, policies keep nothing extra for them.
+//! - `test-util`: for tests with paused tokio time. Probes then follow `tokio::time::pause`, like a
+//!   spawned pacer. Turn it on in `[dev-dependencies]` only, since it costs a little on every
+//!   probe call.
 
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![warn(missing_debug_implementations)]
@@ -142,6 +148,8 @@ pub use gate::{Closed, Gate, Ticket};
 #[cfg(feature = "rt")]
 pub use pacer::PacerHandle;
 pub use pacer::{Decision, Pacer, PacerBuilder};
-pub use policy::{Aimd, Diagnostics, DrainBounded, Fixed, Policy};
+#[cfg(feature = "diagnostics")]
+pub use policy::Diagnostics;
+pub use policy::{Aimd, DrainBounded, Fixed, Policy};
 pub use probe::{IdleGuard, IdleProbe};
 pub use sample::Sample;

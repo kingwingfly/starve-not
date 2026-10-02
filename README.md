@@ -2,12 +2,12 @@
 
 Keep the slowest stage of a pipeline busy, without letting work pile up.
 
-Say your program downloads items and then runs them through a GPU. The GPU is the expensive
-part, the *bottleneck*, and the whole pipeline only goes as fast as it does. So how many items
-should be on their way at once?
+Say your program downloads items and then runs them through a GPU. The GPU is the *bottleneck*,
+and the whole pipeline only goes as fast as it does. So how many items should be on their way at
+once?
 
-- **Too few**, and the GPU sits idle waiting for downloads.
-- **Too many**, and memory fills up. On shutdown, you also wait a long time for everything
+- **Too few**, and the GPU starves.
+- **Too many**, and memory fills up. On shutdown, it costs a long time for everything
   already started to finish.
 
 The right number depends on download speed, GPU speed and batch size, and those change while
@@ -17,18 +17,17 @@ the program runs. So no fixed number works for long. `starve-not` keeps adjustin
 
 - A **`Gate`** sits at the start of the pipeline and lets items in, up to a *limit*. Each item
   gets a **`Ticket`** that travels with it. When the item is done, the ticket goes back and the
-  next item can come in. If a ticket is dropped by accident (a panic, an early return), it
-  still goes back, so the gate never loses track.
+  next item can come in.
 - An **`IdleProbe`** on the bottleneck measures how long it waits for input.
 - Every couple of seconds, a **`Pacer`** looks at both, asks a **`Policy`** what the limit
-  should be, and updates the gate. Lowering the limit never interrupts work already inside.
-  The gate just lets fewer new items in until it is back under the limit.
+  should be, and updates the gate.
 
 Three policies are included:
 
-- **`DrainBounded`** is the one to start with. It doubles the limit while the bottleneck waits
-  for input and the gate is full. It lowers the limit when the work inside would take too long
-  to finish, 10 seconds by default.
+- **`DrainBounded`** is the one to start with. It raises the limit while the bottleneck starves
+  and the gate is nearly full, provided items are succeeding. It checks whether raises improve
+  throughput and uses estimated average residence to limit queued work, allowing longer for
+  naturally slow pipelines.
 - **`Aimd`** works like TCP: it raises the limit a little each tick and cuts it when items fail
   or get slow. It needs no probe, so it suits pipelines without one clear bottleneck.
 - **`Fixed`** never changes the limit. Use it as a baseline to measure the others against.
@@ -69,8 +68,9 @@ gate.close();
 gate.drained().await;
 ```
 
-`cargo run --example pipeline` runs a simulated pipeline where downloads and then the device
-get slower, and prints each decision so you can watch the limit adjust.
+`cargo run --example pipeline --features diagnostics` runs a simulated pipeline where
+downloads and then the device get slower, and prints each decision so you can watch the limit
+adjust.
 
 ## Why not use …
 
@@ -84,7 +84,11 @@ get slower, and prints each decision so you can watch the limit adjust.
 
 - `rt` (on by default): adds `Pacer::spawn`, which runs the pacer as a tokio task. Without it,
   call `Pacer::step` yourself on a timer.
-- `tracing`: logs each of the pacer's decisions at the `debug` level.
+- `diagnostics`: adds `Policy::diagnostics`, the values a policy decided from, for logs and
+  metrics. Without it, policies keep nothing extra for them.
+- `test-util`: for tests with paused tokio time. Probes then follow `tokio::time::pause`, like a
+  spawned pacer. Turn it on in `[dev-dependencies]` only, since it costs a little on every
+  probe call.
 
 ## License
 

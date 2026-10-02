@@ -328,7 +328,8 @@ impl Gate {
     /// back, or to be cancelled.
     pub async fn drained(&self) {
         loop {
-            let notified = self.inner.drained.notified();
+            let mut notified = pin!(self.inner.drained.notified());
+            notified.as_mut().enable();
             // an acquire counts its permits as held before it stops counting as admitting, so
             // reading `admitting` first can't miss one that is between the two
             if self.inner.admitting.load(SeqCst) == 0 && self.inner.held.load(SeqCst) == 0 {
@@ -349,13 +350,13 @@ impl Gate {
         // caller, so the limit read here is normally the one the swap replaces; if not, the
         // check after the swap still counts the shrink, and a needless count only costs a
         // weighted acquire a refund
-        let started = target < self.inner.limit.load(SeqCst);
-        if started {
+        let is_shrink_expected = target < self.inner.limit.load(SeqCst);
+        if is_shrink_expected {
             self.inner.shrinks.fetch_add(1, SeqCst);
         }
         let current = self.inner.limit.swap(target, SeqCst);
-        let shrinking = target < current;
-        if shrinking && !started {
+        let is_shrinking = target < current;
+        if is_shrinking && !is_shrink_expected {
             self.inner.shrinks.fetch_add(1, SeqCst);
         }
         if target > current {
@@ -371,7 +372,7 @@ impl Gate {
             let forgotten = self.inner.sem.forget_permits(shrink);
             self.circulate(forgotten);
         }
-        if started || shrinking {
+        if is_shrink_expected || is_shrinking {
             // done: even again
             self.inner.shrinks.fetch_add(1, SeqCst);
             self.inner.shrunk.notify_waiters();
@@ -389,11 +390,11 @@ impl Gate {
     }
 
     /// Return `n` held permits, counting them as completed or released.
-    fn give_back(&self, n: usize, completed: bool) {
+    fn give_back(&self, n: usize, is_completed: bool) {
         if n == 0 {
             return;
         }
-        let counter = match completed {
+        let counter = match is_completed {
             true => &self.inner.completed,
             false => &self.inner.released,
         };
@@ -590,14 +591,14 @@ impl Ticket {
         self.give_back(n, false);
     }
 
-    fn give_back(&mut self, n: usize, completed: bool) {
+    fn give_back(&mut self, n: usize, is_completed: bool) {
         assert!(
             n <= self.permits,
             "returned {n} permits from a ticket holding {}",
             self.permits
         );
         self.permits -= n;
-        self.gate.give_back(n, completed);
+        self.gate.give_back(n, is_completed);
     }
 }
 
