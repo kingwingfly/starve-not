@@ -33,9 +33,10 @@ name = "pipeline"
 required-features = ["rt", "diagnostics"]
 
 [dev-dependencies]
-# turns on `diagnostics` and `test-util` for tests and examples, so a plain `cargo test` runs
-# the simulations (which read diagnostics) and the paused-clock tests; dropped when publishing
-starve-not = { path = ".", default-features = false, features = ["diagnostics", "test-util"] }
+# turns on `diagnostics` for tests and examples, so a plain `cargo test` runs the simulations,
+# which read it; dropped when publishing. Not `test-util`, so tests run the probes' normal clock:
+# the paused-clock tests need `cargo test --features test-util` (or `--all-features`)
+starve-not = { path = ".", default-features = false, features = ["diagnostics"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [package.metadata.docs.rs]

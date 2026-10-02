@@ -1,6 +1,5 @@
 //! Under `tokio::time::pause`, probes and a spawned pacer share tokio's clock, so paused tests
-//! see consistent idle times. Needs the `test-util` feature, which the repo turns on for its own
-//! tests.
+//! see consistent idle times. Needs the `test-util` feature: `cargo test --features test-util`.
 
 #![cfg(feature = "test-util")]
 

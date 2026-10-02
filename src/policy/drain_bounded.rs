@@ -96,20 +96,20 @@ use crate::Sample;
 ///
 /// Queueing only adds to residence, so the fastest time only goes down. To accept an upstream
 /// that got slower for good, it creeps up by [`fastest_decay`] while the bottleneck waits, since
-/// then nothing queues for it. Not after a useless raise, though (see below), until a raise
-/// helps again: that raise showed items queue where no probe sees.
+/// then nothing queues for it. Not while raises wait after a useless raise, though (see below):
+/// that raise showed items queue where no probe sees.
 ///
 /// # Raising
 ///
 /// The limit is multiplied by [`growth`] when the bottleneck waits for input (more than
 /// [`starving_share`] of a tick) while the gate is nearly full (90%), and only if:
 ///
-/// - residence is within the bound: more items can't make them leave sooner. Only a retry after
-///   a useless raise may go past it (see below);
+/// - residence is within the bound: more items can't make them leave sooner;
 /// - items succeed: at least one since the last change, and at least half of those leaving
 ///   lately. Items that fail fast, or hang, would otherwise look like a hungry bottleneck;
 /// - the previous raise had time to show: one pass, at most [`max_settle`]. If it is still on
-///   trial (see below), departures must have risen with it, and it must not be a retry;
+///   trial (see below), departures must have risen with it, and no raise may have been useless
+///   since one last helped: then each raise is judged on its own;
 /// - raises aren't waiting after a useless raise.
 ///
 /// # Checking a raise
@@ -125,10 +125,7 @@ use crate::Sample;
 ///                                                   | no
 ///            residence past the bound? ------------ no --> keep it: it does no harm
 ///                                                   | yes
-///            departures fell? --------------------- yes -> take it back. Something else
-///                                                   | no     changed, such as upstream
-///                                                   |        hanging: raises wait only if
-///                                                   v        an earlier raise was useless
+///                                                   v
 ///                     take it back: items queue where no probe sees,
 ///                     such as behind the bottleneck. Raises wait
 /// ```
@@ -141,7 +138,8 @@ use crate::Sample;
 /// Under the same conditions, the same raise would be just as useless. So raises wait until the
 /// *pace* changes, that is, until whatever holds the items up gets faster or slower. The policy
 /// measures how many items leave per second at the restored limit, in stretches of at least
-/// [`window_items`] items and one pass, and compares each stretch with the ones before:
+/// [`window_items`] items and one pass, and compares each stretch with the pace just before the
+/// raise and the stretches since:
 ///
 /// ```text
 /// stretch:  1         2       3                4
@@ -159,9 +157,9 @@ use crate::Sample;
 ///   change.
 ///
 /// The raise may have been judged wrongly, so the wait also ends after a while even if the pace
-/// stays the same: after 16 stretches, longer the more the pace varies by chance. However the
-/// wait ends, one *retry* may go past the bound, to find out whether a raise helps now. A retry
-/// that is useless again is taken back, and the next wait is twice as long:
+/// stays the same: after 16 stretches, longer the more the pace varies by chance. Then raises
+/// may try again. A retry that is useless again is taken back, and the next wait is twice as
+/// long:
 ///
 /// ```text
 /// limit      retry          retry                    retry
@@ -254,12 +252,8 @@ pub struct DrainBounded {
     useless_raise: Option<UselessRaise>,
     /// how much the pace varies by chance, learned while raises wait after a useless raise
     pace_dispersion: Dispersion,
-    /// raises taken back as useless since one last helped. Each doubles the wait after the next.
-    /// While there are any, items queue where no probe sees
+    /// raises taken back as useless since one last helped: each doubles the wait after the next
     useless_in_a_row: u32,
-    /// a wait after a useless raise just ended: the next raise may go past the bound, to find
-    /// out whether it helps now
-    is_retry_due: bool,
     /// no raise before this: the latest raise's items haven't reached the bottleneck
     raise_after: Option<Instant>,
     /// no cut before this: the latest cut's excess hasn't left
@@ -299,46 +293,29 @@ struct RaiseTrial {
 }
 
 impl RaiseTrial {
-    /// What the departures in `window` show about the latest raise, if it takes a rise of
-    /// `noise` times the chance to count as helping. A waiting bottleneck gets more work from more
-    /// items, so departures follow the limit.
-    fn verdict(
+    /// Whether the departures in `window` rose with the latest raise: by at least half as much as
+    /// the limit, and by `noise` times more than chance. A waiting bottleneck gets more work from
+    /// more items, so departures follow the limit; if they don't, the items queue where no probe
+    /// sees.
+    fn is_departure_rate_up(
         &self,
         limit: usize,
         window: &Tally,
         dispersion: &Dispersion,
         noise: f64,
-    ) -> Verdict {
+    ) -> bool {
         if self.window_before.departed == 0 {
-            return Verdict::Helped;
+            return true;
         }
         if window.departed == 0 {
-            return Verdict::Unclear;
+            return false;
         }
         let raised = limit as f64 / self.before_latest as f64 - 1.0;
         let needed = (1.0 + raised / 2.0).ln();
         let rose = (window.departure_rate() / self.window_before.departure_rate()).ln();
         let chance = window.rate_wobble(&self.window_before) * dispersion.value().sqrt();
-        if rose >= needed.max(noise * chance) {
-            Verdict::Helped
-        } else if rose < -PACE_NOISE * chance {
-            Verdict::Unclear
-        } else {
-            Verdict::Useless
-        }
+        rose >= needed.max(noise * chance)
     }
-}
-
-/// What a raise trial shows about the latest raise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
-    /// departures rose with it: by at least half as much, and by more than chance
-    Helped,
-    /// departures didn't rise with it: the items queue where no probe sees
-    Useless,
-    /// departures fell, by more than chance: something else changed, such as upstream hanging,
-    /// so the raise can't be judged
-    Unclear,
 }
 
 /// How far departures must rise, during a raise's trial, for another raise to follow it, in
@@ -368,6 +345,11 @@ const ASSUMED_COMPARISONS: f64 = 4.0;
 /// About how many of the latest comparisons the dispersion is measured from, so it follows a
 /// pipeline that changes how it sends items out.
 const DISPERSION_MEMORY: f64 = 50.0;
+
+/// The most the dispersion is taken to be: a stage sending items out in batches of 100. Beyond
+/// that, slow drift is the likelier cause than chance, and it would stretch waits and thresholds
+/// without end.
+const MAX_DISPERSION: f64 = 100.0;
 
 /// How many measured stretches raises wait after a useless raise before trying again, even if
 /// the pace stays the same. The raise may have been judged wrongly, and waiting for good could
@@ -425,7 +407,9 @@ impl Dispersion {
 
     /// The dispersion measured so far, leaning on 1 while there are few comparisons.
     fn value(&self) -> f64 {
-        (ASSUMED_COMPARISONS + self.squares) / (ASSUMED_COMPARISONS + self.comparisons)
+        let measured =
+            (ASSUMED_COMPARISONS + self.squares) / (ASSUMED_COMPARISONS + self.comparisons);
+        measured.min(MAX_DISPERSION)
     }
 }
 
@@ -642,9 +626,8 @@ impl DrainBounded {
         /// So on each tick where it measures while the bottleneck waits for input, the policy
         /// first raises the fastest time by this factor, then lowers it to the measurement if
         /// that is faster. Only while the bottleneck waits: then nothing queues for it, so a
-        /// longer time means upstream got slower, not that items queue. And not after a raise
-        /// that didn't help, until a raise helps again: that raise showed items queue where no
-        /// probe sees.
+        /// longer time means upstream got slower, not that items queue. And not while raises wait
+        /// after a raise that didn't help: that raise showed items queue where no probe sees.
         ///
         /// For example, if the fastest time is 20 seconds and items now take 30, it reaches 30
         /// after about 9 such ticks (1.05⁹ ≈ 1.55). 1 means it never rises.
@@ -704,7 +687,6 @@ impl DrainBounded {
             useless_raise: None,
             pace_dispersion: Dispersion::default(),
             useless_in_a_row: 0,
-            is_retry_due: false,
             raise_after: None,
             cut_after: None,
             residence: f64::INFINITY,
@@ -835,7 +817,6 @@ impl Policy for DrainBounded {
                 if is_apart && earlier.is_some_and(|earlier| (earlier.gap > 0.0) == (gap > 0.0)) {
                     // the second in a row to differ this way: not chance
                     self.useless_raise = None;
-                    self.is_retry_due = true;
                 } else {
                     // an earlier one that differed was chance
                     if let Some(earlier) = earlier {
@@ -864,7 +845,6 @@ impl Policy for DrainBounded {
             && useless.stretches as f64 >= stretches
         {
             self.useless_raise = None;
-            self.is_retry_due = true;
         }
 
         // 3. Learn the fastest time, from a full gate, and from enough items over a whole pass
@@ -880,7 +860,7 @@ impl Policy for DrainBounded {
         {
             // creep up only while nothing queues: the bottleneck waits, and no useless raise
             // showed that items queue where no probe sees
-            if is_starving && self.useless_in_a_row == 0 {
+            if is_starving && self.useless_raise.is_none() {
                 self.fastest *= c.fastest_decay;
             }
             self.fastest = self.fastest.min(settled);
@@ -927,39 +907,35 @@ impl Policy for DrainBounded {
         // stuck: drop to the floor. Nothing else would cut: the bound only acts on a busy
         // bottleneck, once known
         let is_dropping = is_stuck && (is_starving || drain_bound.is_infinite()) && is_cut_allowed;
-        // what the trial that just ended shows, if it can be judged
-        let verdict = ended
-            .filter(|trial| trial.is_checkable)
-            .map(|trial| trial.verdict(limit, &window, &self.pace_dispersion, PACE_NOISE));
-        // a raise not shown to help that pushed residence past the bound is taken back. If
-        // departures stayed the same, it only lengthened a hidden queue: raises then wait. If
-        // they fell, something else changed, and the raise says nothing new: raises wait only
-        // if a hidden queue is already known
-        let taken_back = ended.filter(|_| {
-            verdict.is_some_and(|verdict| verdict != Verdict::Helped)
-                && is_starving
-                && self.residence > raise_bound
+        // whether the trial that just ended shows the raise helped, if it can be judged
+        let is_up = ended.filter(|trial| trial.is_checkable).map(|trial| {
+            trial.is_departure_rate_up(limit, &window, &self.pace_dispersion, PACE_NOISE)
         });
-        let is_useless = taken_back.is_some() && verdict == Some(Verdict::Useless);
-        if is_useless {
+        // a raise that brought no more departures and pushed residence past the bound only
+        // lengthened a hidden queue: take it back, and wait
+        let useless =
+            ended.filter(|_| is_up == Some(false) && is_starving && self.residence > raise_bound);
+        if let Some(trial) = useless {
             self.useless_in_a_row += 1;
+            // from the pace just before the raise, so a change during the trial still shows
+            self.useless_raise = Some(UselessRaise {
+                baseline: trial.window_before,
+                ..UselessRaise::default()
+            });
         }
-        if taken_back.is_some() && self.useless_in_a_row > 0 {
-            self.useless_raise = Some(UselessRaise::default());
-        }
-        if verdict == Some(Verdict::Helped) {
+        if is_up == Some(true) {
             self.useless_in_a_row = 0;
         }
-        // during a trial, raise again only once the latest raise helped. Not at all while a
-        // hidden queue is known: then a raise is a retry, to be judged on its own
+        // during a trial, raise again only once the latest raise helped. Not at all after a
+        // useless raise, until one helps: then each raise is a retry, judged on its own
         let dispersion = &self.pace_dispersion;
         let is_trial_helping = self.raise_trial.is_none_or(|trial| {
             self.useless_in_a_row == 0
-                && trial.verdict(limit, &window, dispersion, RAISE_NOISE) == Verdict::Helped
+                && trial.is_departure_rate_up(limit, &window, dispersion, RAISE_NOISE)
         });
         let target = if is_dropping {
             0
-        } else if let Some(trial) = taken_back {
+        } else if let Some(trial) = useless {
             trial.before_latest
         } else if self.residence > bound && !is_starving && is_cut_allowed {
             // keep what leaves within the bound. Not while the bottleneck waits: then nothing
@@ -969,10 +945,7 @@ impl Policy for DrainBounded {
         } else if is_starving
             && is_saturated
             && is_raise_allowed
-            // past the bound only to retry after a wait. Otherwise, once upstream got slower
-            // for good, the limit could never rise again, since the fastest time doesn't creep
-            // up while a hidden queue is known
-            && (self.residence <= raise_bound || self.is_retry_due)
+            && self.residence <= raise_bound
             && self.useless_raise.is_none()
             && is_trial_helping
             && self.is_succeeding
@@ -990,7 +963,6 @@ impl Policy for DrainBounded {
             self.is_succeeding = false;
         }
         if target > limit {
-            self.is_retry_due = false;
             // the new items reach the bottleneck, and start leaving, about one pass from now
             let pass = self.pass_estimate();
             self.raise_after = sample.at.checked_add(pass.min(c.max_settle));
@@ -1006,17 +978,21 @@ impl Policy for DrainBounded {
         } else if target < limit {
             self.raise_trial = None;
             self.raise_after = None;
-            // the pace at the old limit no longer holds: measure it again. Not after a cut to
-            // the floor, such as when the pipeline gets stuck: there the limit sets the pace, so
-            // it would never change, and what the useless raises showed no longer holds. Taking
-            // a raise back to the floor is different: its wait just began
-            let is_floor_cut = target == c.floor && (is_dropping || taken_back.is_none());
-            if self.useless_raise.is_some() {
-                self.useless_raise = (!is_floor_cut).then(UselessRaise::default);
-            }
+            // the pace at the old limit no longer holds: measure it again, still counting toward
+            // the wait's end. Not for a useless raise just taken back: its wait just began. A cut
+            // to the floor, such as when the pipeline gets stuck, ends the wait instead: there
+            // the limit sets the pace, so it would never change
+            let is_floor_cut = target == c.floor && (is_dropping || useless.is_none());
             if is_floor_cut {
+                self.useless_raise = None;
                 self.useless_in_a_row = 0;
-                self.is_retry_due = false;
+            } else if let Some(waiting) = self.useless_raise
+                && useless.is_none()
+            {
+                self.useless_raise = Some(UselessRaise {
+                    stretches: waiting.stretches,
+                    ..UselessRaise::default()
+                });
             }
             // until the excess leaves at the current rate
             let hold = match sample.in_flight.saturating_sub(target) {

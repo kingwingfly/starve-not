@@ -60,6 +60,8 @@ struct Pipeline {
     secs: f64,
     /// Seconds an item spends upstream, drawn uniformly.
     latency: Range<f64>,
+    /// From the given second on, the latency is this instead.
+    latency_change: Option<(f64, Range<f64>)>,
     /// Items per second the bottleneck handles.
     bottleneck_rate: Changes,
     /// Items admitted in this time range fail upstream after 0.2s.
@@ -83,6 +85,7 @@ impl Default for Pipeline {
         Self {
             secs: 300.0,
             latency: 1.0..2.0,
+            latency_change: None,
             bottleneck_rate: vec![(0.0, 120.0)],
             failing: None,
             hanging: None,
@@ -213,8 +216,11 @@ fn run(pipeline: &Pipeline, mut policy: DrainBounded) -> Run {
                         Some(h) if h.contains(&t) => h.end - t,
                         _ => 0.0,
                     };
-                    let span = pipeline.latency.end - pipeline.latency.start;
-                    let latency = pipeline.latency.start + rng.unit() * span;
+                    let range = match &pipeline.latency_change {
+                        Some((from, changed)) if t >= *from => changed,
+                        _ => &pipeline.latency,
+                    };
+                    let latency = range.start + rng.unit() * (range.end - range.start);
                     (hang + latency, Event::Arrive)
                 }
             };
@@ -877,4 +883,47 @@ fn useless_raise_is_retried_less_and_less() {
     }
     // and each retry was taken back
     assert_eq!(run.limit_at(40_000.0), run.limit_at(300.0));
+}
+
+/// Upstream gets much slower for good, with no stage behind the bottleneck. The policy must
+/// learn the new pace and settle, not keep raising and taking back.
+#[test]
+fn upstream_getting_slower_for_good_is_learned() {
+    let pipeline = Pipeline {
+        latency: 2.0..4.0,
+        latency_change: Some((4000.0, 35.0..45.0)),
+        secs: 12_000.0,
+        ..Pipeline::default()
+    };
+    let run = run(&pipeline, policy());
+
+    let raises = run.raises(4000.0..);
+    assert!(raises <= 5, "{raises} raises after upstream got slower");
+    let fastest = run.policy.fastest().unwrap();
+    assert!(fastest >= Duration::from_secs(30), "fastest {fastest:?}");
+    let last = run.last();
+    assert!(last.residence <= last.bound, "{last:?}");
+}
+
+/// The stage behind the bottleneck speeds up, then upstream gets much slower, right as a raise
+/// is on trial. The change must still end the wait after that raise: the limit must not stay
+/// low while the bottleneck starves.
+#[test]
+fn pace_change_during_a_raise_trial_still_ends_the_wait() {
+    let pipeline = Pipeline {
+        latency: 8.0..8.0,
+        latency_change: Some((4000.0, 38.0..42.0)),
+        sink_rate: vec![(0.0, 0.5), (2000.0, 0.75)],
+        secs: 12_000.0,
+        ..Pipeline::default()
+    };
+    let run = run(&pipeline, DrainBounded::builder().max(MAX).build());
+
+    // at 0.75 items/s and about 40s upstream, it takes about 30 items inside
+    let low = run.steps.iter().filter(|s| s.t > 4000.0 && s.target <= 16);
+    let low_secs = low.count() as f64 * 2.0;
+    assert!(
+        low_secs < 600.0,
+        "{low_secs}s at 16 or less after upstream got slower"
+    );
 }
