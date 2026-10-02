@@ -1,13 +1,12 @@
 //! Keep the slowest stage of a pipeline busy without letting work pile up.
 //!
 //! Picture a pipeline where items are downloaded, then processed on a GPU. The GPU is the
-//! expensive part, the *bottleneck*, and the whole pipeline goes only as fast as it does. You
-//! want two things:
+//! *bottleneck*, and the whole pipeline goes only as fast as it does. You want two things:
 //!
-//! 1. **The GPU never waits for input.** Enough items must be on their way to cover the time
-//!    downloads take, even when downloads suddenly get slower.
+//! 1. **The GPU never starves.** Enough items must be on their way to cover the time downloads
+//!    take, even when downloads suddenly get slower.
 //! 2. **Not too much is on its way.** Every item admitted into the pipeline uses memory, and on
-//!    shutdown you have to wait for all of them to finish. That wait should stay short.
+//!    shutdown it costs time for all of them to finish. That should stay short.
 //!
 //! No single fixed number gets both right, because the right number depends on download speed,
 //! GPU speed and batch size, and those change while the program runs. `starve-not` adjusts the
@@ -25,9 +24,10 @@
 //!
 //! Three policies come with the crate:
 //!
-//! - [`DrainBounded`] (the one to start with) raises the limit while the bottleneck waits for
-//!   input and items succeed. It checks whether raises help and controls work in flight using
-//!   estimated average residence. This is a target, not a shutdown deadline.
+//! - [`DrainBounded`] (the one to start with) raises the limit while the bottleneck starves and
+//!   the gate is nearly full, provided items are succeeding. It checks whether raises improve
+//!   throughput and uses estimated average residence to limit queued work, allowing longer for
+//!   naturally slow pipelines.
 //! - [`Aimd`] raises the limit slowly and cuts it when items fail or get slow. It needs no probe,
 //!   so it suits pipelines without one clear bottleneck.
 //! - [`Fixed`] never changes the limit. It is useful as a baseline when measuring the others.
