@@ -384,7 +384,7 @@ impl Gate {
         let retired = self
             .inner
             .retiring
-            .fetch_update(Relaxed, Relaxed, |r| (r > 0).then(|| r - r.min(n)))
+            .try_update(Relaxed, Relaxed, |r| (r > 0).then(|| r - r.min(n)))
             .map_or(0, |r| r.min(n));
         self.inner.sem.add_permits(n - retired);
     }
