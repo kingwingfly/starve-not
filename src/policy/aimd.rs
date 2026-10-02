@@ -107,38 +107,36 @@ impl Aimd {
         /// `tolerance` is below 0 or 1 or more.
     }))]
     pub fn new(
-        /// The lowest the limit goes. Default: 1.
+        /// The lowest the limit goes. Must be at least 1.
         #[builder(default = 1)]
         floor: usize,
-        /// The highest the limit goes. Default: `usize::MAX`, that is, no cap.
+        /// The highest the limit goes.
         ///
         /// This policy keeps raising the limit until something goes wrong, so without a cap it can
         /// grow very large before it does. Set this if memory needs a hard cap, for example a
         /// number of items, or megabytes for weighted items. If set below `floor`, `floor` is used.
         #[builder(default = usize::MAX)]
         max: usize,
-        /// The limit to start with. Default: `floor`. Kept between `floor` and `max`.
+        /// Starting limit, kept between `floor` and `max`. An unset value starts at `floor`.
         initial: Option<usize>,
-        /// How much the limit grows on each good tick. Default: 1.
+        /// How much the limit grows on each good tick. Must be at least 1.
         ///
-        /// The default grows slowly: with 2-second ticks, going from 10 to 100 takes three
-        /// minutes. Raise it if your pipeline needs hundreds of items inside.
+        /// An increase of 1 with 2-second ticks takes three minutes to grow from 10 to 100.
+        /// Use a larger increase if your pipeline needs hundreds of items inside.
         #[builder(default = 1)]
         increase: usize,
-        /// What the limit is multiplied by on a bad tick. Default: 0.9, a 10% cut.
+        /// What the limit is multiplied by on a bad tick.
         ///
         /// Must be strictly between 0 and 1.
         #[builder(default = 0.9)]
         backoff: f64,
         /// How long items may take to go through the pipeline before a tick counts as bad.
-        /// Default: 10 seconds.
         #[builder(default = Duration::from_secs(10))]
         max_residence: Duration,
         /// The fraction of items that may be released, rather than completed, on a good tick.
-        /// Default: 0, so any release makes the tick bad.
         ///
-        /// At least 0 and below 1. Raise it if some failures are normal, for example 0.05 to
-        /// allow 5%.
+        /// At least 0 and below 1. Zero makes any release count as a bad tick. Raise it if some
+        /// failures are normal, for example 0.05 to allow 5%.
         #[builder(default = 0.0)]
         tolerance: f64,
     ) -> Self {

@@ -26,7 +26,8 @@
 //! Three policies come with the crate:
 //!
 //! - [`DrainBounded`] (the one to start with) raises the limit while the bottleneck waits for
-//!   input, and lowers it when the work already admitted would take too long to finish.
+//!   input and items succeed. It checks whether raises help and controls work in flight using
+//!   estimated average residence. This is a target, not a shutdown deadline.
 //! - [`Aimd`] raises the limit slowly and cuts it when items fail or get slow. It needs no probe,
 //!   so it suits pipelines without one clear bottleneck.
 //! - [`Fixed`] never changes the limit. It is useful as a baseline when measuring the others.

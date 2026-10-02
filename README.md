@@ -27,9 +27,9 @@ the program runs. So no fixed number works for long. `starve-not` keeps adjustin
 Three policies are included:
 
 - **`DrainBounded`** is the one to start with. It doubles the limit while the bottleneck waits
-  for input and the gate is full, and takes back raises that didn't help. It lowers the limit
-  when the work inside would take too long to finish: 10 seconds on average by default, longer
-  for pipelines that are slow by nature.
+  for input and the gate is nearly full, provided items are succeeding. It checks whether
+  raises improve throughput and uses estimated average residence to limit queued work,
+  allowing longer for naturally slow pipelines. Residence is a target, not a shutdown deadline.
 - **`Aimd`** works like TCP: it raises the limit a little each tick and cuts it when items fail
   or get slow. It needs no probe, so it suits pipelines without one clear bottleneck.
 - **`Fixed`** never changes the limit. Use it as a baseline to measure the others against.

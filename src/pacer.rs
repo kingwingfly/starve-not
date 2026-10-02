@@ -55,7 +55,7 @@ impl<P: Policy> Pacer<P> {
         /// [`probes`](PacerBuilder::probes).
         #[builder(field)]
         probes: Vec<IdleProbe>,
-        /// How often a [`spawn`](Pacer::spawn)ed pacer decides. Default: 2 seconds.
+        /// How often a [`spawn`](Pacer::spawn)ed pacer decides. Must be non-zero.
         ///
         /// Shorter ticks react faster but judge from fewer finished items. A tick should
         /// comfortably cover a few batches going through the bottleneck.
