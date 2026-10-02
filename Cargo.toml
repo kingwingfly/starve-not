@@ -22,11 +22,10 @@ diagnostics = []
 test-util = ["rt", "tokio/test-util"]
 
 [dependencies]
-# 1.51.1: `Semaphore::forget_permits` no longer reopens a closed semaphore (tokio#8021)
-tokio = { version = "1.51.1", default-features = false, features = ["sync"] }
+tokio = { version = "1.53.1", default-features = false, features = ["sync"] }
 parking_lot = "0.12"
 smallvec = "1"
-bon = "3.10.1"
+bon = "3.10.2"
 
 [[example]]
 name = "pipeline"
