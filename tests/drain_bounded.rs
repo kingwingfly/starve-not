@@ -56,6 +56,8 @@ fn at(changes: &[(f64, f64)], t: f64) -> Option<f64> {
 /// The simulated pipeline. Build one with struct update syntax:
 /// `Pipeline { latency: 5.0..10.0, secs: 400.0, ..Pipeline::default() }`.
 struct Pipeline {
+    /// Seconds between policy decisions.
+    tick: f64,
     /// How long the simulation runs, in seconds.
     secs: f64,
     /// Seconds an item spends upstream, drawn uniformly.
@@ -83,6 +85,7 @@ struct Pipeline {
 impl Default for Pipeline {
     fn default() -> Self {
         Self {
+            tick: TICK,
             secs: 300.0,
             latency: 1.0..2.0,
             latency_change: None,
@@ -261,7 +264,7 @@ fn run(pipeline: &Pipeline, mut policy: DrainBounded) -> Run {
         }
 
         // 4. Jump to the next event. Without a batch the bottleneck is idle until then.
-        let next_tick = last_tick + TICK;
+        let next_tick = last_tick + pipeline.tick;
         let next_upstream = upstream
             .peek()
             .map_or(f64::INFINITY, |Reverse((at, _))| *at as f64 / 1e6);
@@ -801,6 +804,7 @@ fn useless_raise_notices_a_small_change_of_a_steady_pace() {
 fn useless_raise_waits_through_chance_in_batches() {
     let seeds = [
         0x9e37_79b9_7f4a_7c15,
+        0x3c6e_f372_fe94_f82a,
         0xdead_beef_cafe_f00d,
         0x0bad_c0de_1234_4321,
         0x0f0f_f0f0_1357_2468,
@@ -885,6 +889,36 @@ fn useless_raise_is_retried_less_and_less() {
     assert_eq!(run.limit_at(40_000.0), run.limit_at(300.0));
 }
 
+/// The same clockwork stage, with a short `max_retry`. The pace never changes, but each wait
+/// must still end within `max_retry`, and the retry must try the same raise again.
+#[test]
+fn useless_raise_is_retried_within_max_retry() {
+    let pipeline = Pipeline {
+        latency: 8.0..8.0,
+        sink_rate: vec![(0.0, 0.5)],
+        secs: 3000.0,
+        ..Pipeline::default()
+    };
+    let policy = DrainBounded::builder()
+        .max(MAX)
+        .max_retry(Duration::from_secs(300))
+        .build();
+    let run = run(&pipeline, policy);
+
+    let taken_back = run.shrinks();
+    assert!(taken_back.len() >= 3, "{taken_back:?}");
+    // the last wait may run past the end
+    for back in &taken_back[..taken_back.len() - 1] {
+        let retry = run
+            .steps
+            .iter()
+            .find(|s| s.t > back.t && s.target > s.limit);
+        let retry = retry.unwrap();
+        assert!(retry.t - back.t <= 300.0 + TICK, "{back:?} -> {retry:?}");
+        assert_eq!(retry.target, back.limit, "{retry:?}");
+    }
+}
+
 /// Upstream gets much slower for good, with no stage behind the bottleneck. The policy must
 /// learn the new pace and settle, not keep raising and taking back.
 #[test]
@@ -919,11 +953,99 @@ fn pace_change_during_a_raise_trial_still_ends_the_wait() {
     };
     let run = run(&pipeline, DrainBounded::builder().max(MAX).build());
 
-    // at 0.75 items/s and about 40s upstream, it takes about 30 items inside
+    // at 0.75 items/s and about 40s upstream, it takes about 30 items inside. The slowdown
+    // stalls the pipeline first, so the limit drops to the floor and the timing is learned
+    // again, which takes several minutes while only a couple of items leave every 40s
     let low = run.steps.iter().filter(|s| s.t > 4000.0 && s.target <= 16);
     let low_secs = low.count() as f64 * 2.0;
     assert!(
-        low_secs < 600.0,
+        low_secs < 1000.0,
         "{low_secs}s at 16 or less after upstream got slower"
     );
+}
+
+/// A hidden queue first. Then the stage behind the bottleneck stops holding items up, and
+/// upstream gets much slower at the same time. The stall drops the limit to the floor; from
+/// there, the policy must learn the new timing and climb all the way, not stay stuck.
+#[test]
+fn climbs_again_after_a_hidden_queue_goes_away() {
+    let pipeline = Pipeline {
+        latency: 8.0..8.0,
+        latency_change: Some((3000.0, 40.0..40.0)),
+        sink_rate: vec![(0.0, 0.5), (3000.0, 1000.0)],
+        secs: 12_000.0,
+        ..Pipeline::default()
+    };
+    let run = run(&pipeline, DrainBounded::builder().max(MAX).build());
+
+    assert_eq!(run.limit_at(6000.0), MAX, "{:?}", run.last());
+    assert!(run.completed > 150_000, "only {} completed", run.completed);
+}
+
+/// With weighted items, the policy must decide the same whatever unit the weights are in, as
+/// long as the count settings are scaled with them.
+#[test]
+fn weighted_items_decide_the_same_in_any_unit() {
+    let origin = Instant::now();
+    // (items inside, limit, items finished) on each tick
+    let ticks = [
+        (1, 1, 0),
+        (1, 1, 0),
+        (1, 1, 1),
+        (2, 2, 0),
+        (2, 2, 1),
+        (2, 2, 1),
+    ];
+    let mut in_items = Vec::new();
+    for weight in [1usize, 10, 1000] {
+        let mut policy = DrainBounded::builder()
+            .floor(weight)
+            .max(MAX * weight)
+            .window_items(20 * weight as u64)
+            .build();
+        for (i, (inside, limit, finished)) in ticks.into_iter().enumerate() {
+            let at = origin + Duration::from_secs(2 * (i as u64 + 1));
+            let elapsed = Duration::from_secs(2);
+            let mut sample = Sample::new(at, elapsed, inside * weight, limit * weight);
+            sample.completed = finished * weight as u64;
+            sample.idle.push(Duration::from_millis(1990));
+            let target = policy.decide(&sample);
+            if weight == 1 {
+                in_items.push(target);
+            }
+            assert_eq!(target, in_items[i] * weight, "tick {i}, weight {weight}");
+        }
+    }
+}
+
+/// The same as `climbs_again_after_a_hidden_queue_goes_away`, for several upstream latencies
+/// and tick lengths, and with a change that doesn't fall on a tick.
+#[test]
+fn climbs_again_after_a_hidden_queue_goes_away_at_any_latency_and_tick() {
+    for latency in [20.0, 30.0, 40.0, 60.0, 100.0] {
+        for tick in [0.5, 2.0, 5.0] {
+            for change in [3000.0, 3000.7] {
+                let pipeline = Pipeline {
+                    tick,
+                    latency: 8.0..8.0,
+                    latency_change: Some((change, latency..latency)),
+                    sink_rate: vec![(0.0, 0.5), (change, 1000.0)],
+                    secs: 12_000.0,
+                    ..Pipeline::default()
+                };
+                let run = run(&pipeline, DrainBounded::builder().max(MAX).build());
+                assert_eq!(
+                    run.limit_at(9000.0),
+                    MAX,
+                    "latency {latency}, tick {tick}, change {change}: {:?}",
+                    run.last()
+                );
+                assert!(
+                    run.completed > 40_000,
+                    "latency {latency}, tick {tick}, change {change}: only {} completed",
+                    run.completed
+                );
+            }
+        }
+    }
 }

@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 /// Printing it gives `name=value` pairs separated by spaces.
 #[derive(Clone, Default, PartialEq)]
 // room for all of `DrainBounded`'s values without allocating
-pub struct Diagnostics(SmallVec<[(&'static str, f64); 10]>);
+pub struct Diagnostics(SmallVec<[(&'static str, f64); 11]>);
 
 impl Diagnostics {
     /// Add a value.
