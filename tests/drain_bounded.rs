@@ -889,10 +889,10 @@ fn useless_raise_is_retried_less_and_less() {
     assert_eq!(run.limit_at(40_000.0), run.limit_at(300.0));
 }
 
-/// The same clockwork stage, with a short `max_retry`. The pace never changes, but each wait
-/// must still end within `max_retry`, and the retry must try the same raise again.
+/// The same clockwork stage, with a short `max_retry_interval`. The pace never changes, but each
+/// wait must still end within it, and the retry must try the same raise again.
 #[test]
-fn useless_raise_is_retried_within_max_retry() {
+fn useless_raise_is_retried_within_max_retry_interval() {
     let pipeline = Pipeline {
         latency: 8.0..8.0,
         sink_rate: vec![(0.0, 0.5)],
@@ -901,7 +901,7 @@ fn useless_raise_is_retried_within_max_retry() {
     };
     let policy = DrainBounded::builder()
         .max(MAX)
-        .max_retry(Duration::from_secs(300))
+        .max_retry_interval(Duration::from_secs(300))
         .build();
     let run = run(&pipeline, policy);
 

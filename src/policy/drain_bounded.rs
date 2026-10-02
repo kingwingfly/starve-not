@@ -12,14 +12,12 @@ use super::Diagnostics;
 use super::Policy;
 use crate::Sample;
 
-/// Keeps the bottleneck fed while limiting unnecessary work in flight, using an estimate of
-/// average residence time.
+/// Raises the limit while the bottleneck starves, and lowers it when items stay inside too long.
 ///
-/// This is the policy to start with. It needs an [`IdleProbe`](crate::IdleProbe) on the
-/// bottleneck: the probe is how it learns that the bottleneck waits. Without one it never raises
+/// It needs an [`IdleProbe`](crate::IdleProbe) on the bottleneck. Without one it never raises
 /// the limit.
 ///
-/// # What it aims for
+/// # Model
 ///
 /// ```text
 ///              limit: how many items may be inside at once
@@ -29,47 +27,54 @@ use crate::Sample;
 ///              residence: how long an item stays inside
 /// ```
 ///
-/// It has two goals, which pull in opposite directions:
+/// Two goals pull the limit in opposite directions:
 ///
-/// 1. **Keep the bottleneck busy.** When its probe reports waiting for input, more items inside
-///    may help feed it.
-/// 2. **Avoid unnecessary queues.** Aim for average residence near [`drain_target`], allowing
-///    longer for pipelines that are slow by nature. Less queued work also helps shorten shutdown.
+/// 1. **Keep the bottleneck busy.** While its probe says it waits for input, raise the limit.
+/// 2. **Avoid needless queues.** Keep residence within the *bound*.
 ///
-/// The limit only decides how fast upstream is fed. From the bottleneck on, everything runs at
-/// its own pace. A ticket is held until its item is done, so time spent after the bottleneck
-/// counts too.
+/// ```text
+/// residence = items inside / items leaving per second     (Little's law, over recent ticks)
+/// bound     = max(drain_target, max_slowdown x fastest)
+/// ```
 ///
-/// Residence is estimated from work in flight and departures, not from individual item timings.
-/// It can be inaccurate while the pipeline changes, and some items take much longer than the
-/// average. The residence bound is a control target, not a deadline for items or shutdown.
-/// Set [`max`] to cap the admission limit. Lowering a limit never cancels work already inside.
+/// *Fastest* is the lowest residence seen while the gate was nearly full. Usually
+/// [`drain_target`] sets the bound; [`max_slowdown`] takes over for pipelines that are slow by
+/// nature. Measurements only lower fastest, so to follow an upstream that got slower for good,
+/// it creeps up by [`fastest_decay`] on each tick the bottleneck starves.
 ///
-/// # How it behaves
+/// Residence is an average, so the bound is a target, not a deadline for items or shutdown.
+/// For a hard cap, set [`max`].
 ///
-/// - **Starting up.** When the bottleneck waits, the gate is nearly full, and items succeed,
-///   the policy tries higher limits. Each raise doubles the limit by default.
-/// - **The bottleneck gets slower.** When it is busy and residence exceeds the bound, the
-///   policy reduces admission to what the pipeline is estimated to clear within that bound.
-/// - **Upstream gets slower.** More items may be needed to keep the bottleneck fed. The policy
-///   can learn a longer residence target, or retry a raise past an old bound. The target is at
-///   least [`drain_target`] and at least [`max_slowdown`] times the fastest measured residence.
-/// - **More items don't help.** Sometimes the bottleneck waits, yet letting more items in
-///   doesn't make more of them finish: something the probe can't see holds them up, such as a
-///   slower stage after the bottleneck. Once timing can be measured, each raise is checked.
-///   A raise without enough benefit may be taken back, followed by a cooldown before another
-///   attempt. A change in departure rate can end that cooldown early.
-/// - **Items fail or hang.** An idle probe alone cannot trigger growth: the policy also needs
-///   recent successful departures. Failures count as departures, but not successes.
-/// - **The pipeline stalls.** After an unusually long gap in departures, the policy can drop
-///   to [`floor`]. A stall that causes this cut also resets the timing estimates.
+/// # Each tick
 ///
-/// Changes take time to show, so each change delays the next one in the same direction. That
-/// settling delay is capped by [`max_settle`]. Checking a raise and waiting through a cooldown
-/// can take longer; [`max_retry`] caps only the cooldown.
+/// The first rule that matches sets the limit:
 ///
-/// In a typical run, the limit doubles while the bottleneck waits, until items would take too
-/// long or a raise stops helping:
+/// ```text
+/// stuck, and the bottleneck starves? ------ yes -> `floor`, and learn fastest again
+///   | no
+/// a raise didn't help, residence > bound? - yes -> take it back
+///   | no
+/// bottleneck busy, residence > bound? ----- yes -> cut to departures per second x bound
+///   | no
+/// bottleneck starves, gate >= 90% full,
+/// residence <= bound, items succeed? ------ yes -> raise to limit x `growth`
+///   | no
+/// keep the limit
+/// ```
+///
+/// - *Stuck*: nothing has left for longer than [`max_window`], and for twice the longest gap
+///   seen before. With a busy bottleneck, the cut rule handles it instead.
+/// - *Items succeed*: one was done since the last change, and at least half of those leaving
+///   lately were.
+/// - Cuts need a busy bottleneck: while it starves, nothing queues in front of it, and a long
+///   residence is a slow upstream, which a cut can't shorten.
+/// - Until fastest is known, at the start and after getting stuck, there is no bound: cuts are
+///   off, and raises stop once residence reaches [`drain_target`].
+/// - Raises also follow the [raise check](#checking-raises), and changes wait until the last
+///   one shows (see [Timing](#timing)).
+///
+/// In a typical run, the limit doubles while the bottleneck starves, until residence reaches
+/// the bound or a raise stops helping:
 ///
 /// ```text
 /// limit
@@ -83,205 +88,91 @@ use crate::Sample;
 ///     +-------------------------------------> time
 /// ```
 ///
+/// # Checking raises
+///
+/// A starving probe doesn't prove that more items help: something it can't see may hold them
+/// up, such as a slower stage after the bottleneck. So every raise is checked, and this state
+/// machine decides when raises may happen:
+///
+/// ```text
+///      +---------------------------------------------+
+///      v                                             |
+/// +--------+   raise    +-------+   helped, or       |
+/// | Steady | ---------> | Trial | ---- harmless -----+
+/// +--------+            +-------+
+///      ^                    | didn't help, and residence > bound:
+///      |                    | take it back
+///      |                    v
+///      |              +----------+
+///      |              | Cooldown | <------------------------+
+///      |              +----------+                          |
+///      |                    | departures per second         |
+///      |                    | changed, or time is up        | didn't help:
+///      |                    v                               | take it back
+///      |    helped      +-------+                           |
+///      +--------------- | Retry | --------------------------+
+///                       +-------+
+/// ```
+///
+/// - **Steady**: the tick rules apply as they are.
+/// - **Trial**: more items should make more leave, so departures per second should rise by at
+///   least half as much as the limit (+50% for a doubling), and by more than chance. The trial
+///   first lets as many items leave as were inside at the raise, then counts at least
+///   [`window_items`] more. Meanwhile, the bound widens by as much as the limit rose, since the
+///   new items haven't left yet. A raise that didn't help is kept if residence is still within
+///   the bound: it does no harm. If the trial can't tell in time, the raise counts as not
+///   helping.
+/// - **Cooldown**: no raises, since the same raise would be just as useless under the same
+///   conditions. Departures per second at the restored limit are measured over and over, each
+///   time from at least [`window_items`] items. Two measurements in a row that differ the same
+///   way, by more than chance and by at least 10%, mean the conditions changed. Otherwise time
+///   is up after 16 measurements (more if departures are noisy), twice as many after each retry
+///   that didn't help, and after [`max_retry_interval`] at most.
+/// - **Retry**: once the restored limit is measured, the next raise may go past the bound, since
+///   the conditions changed, or the raise was judged wrongly. It's kept only if it clearly
+///   helps.
+///
+/// Shortcuts: raises made before fastest is known aren't checked. While starting up, another
+/// raise may join a trial once departures already rose. A cut ends a trial, and a drop to
+/// [`floor`] ends a cooldown.
+///
+/// *Chance* is how much departures per second vary on their own. It's estimated from how many
+/// items leave each tick, and corrected during cooldowns for pipelines whose items leave in
+/// bursts. The more they vary, the bigger a change must be to count.
+///
+/// # Timing
+///
+/// Residence and departures per second are measured over recent ticks: enough to see
+/// [`window_items`] items leave and an item go all the way through, but no more than
+/// [`max_window`], unless an item takes longer than that.
+///
+/// A change takes time to show, and until then the measurements still reflect the old limit.
+/// So after a raise, the next raise waits about one residence, for the new items to reach the
+/// bottleneck. After a cut, the next cut waits for the excess items to leave. Both waits are at
+/// most [`max_settle`]. A change the other way doesn't wait.
+///
 /// # Tuning
 ///
-/// Start with the defaults, then consider these settings:
+/// Start with the defaults. These are the settings most worth a look:
 ///
 /// | Setting | Change it to |
 /// |---|---|
-/// | [`drain_target`] | target less queued work (lower), or allow more inside (higher) |
+/// | [`drain_target`] | queue less (lower), or allow more inside (higher) |
 /// | [`floor`] | two batches, if the bottleneck takes items in batches |
-/// | [`max`] | cap admission in items or weighted permits |
+/// | [`max`] | put a hard cap on items, or on memory with weighted items |
 /// | [`max_slowdown`] | give pipelines that are slow by nature a bigger buffer (higher) |
-/// | [`max_retry`] | shorten the cooldown after a raise is taken back (lower) |
+/// | [`max_retry_interval`] | retry sooner after a raise was taken back (lower) |
 ///
 /// The others ([`initial`], [`growth`], [`starving_share`], [`window_items`], [`max_window`],
-/// [`max_settle`] and [`fastest_decay`]) fine-tune how quickly it reacts and how much it
-/// measures first.
-///
-/// # How it decides
-///
-/// You don't need this to use the policy. It explains the decisions, for example when reading
-/// the [diagnostics](#diagnostics). Every tick, it asks:
-///
-/// ```text
-/// eligible for a stall cut? ----------------------- yes -> drop to `floor`
-///   | no
-/// trial ended and must be taken back? ------------- yes -> restore the previous limit
-///   | no
-/// bottleneck busy, over bound, cut delay passed? --- yes -> cut to what leaves in time
-///   | no
-/// bottleneck waiting, gate nearly full, and safe? -- yes -> raise: limit x `growth`
-///   | no
-/// keep the limit
-/// ```
-///
-/// ## Residence and the bound
-///
-/// *Residence* is estimated average work in flight divided by departures per second, including
-/// unsuccessful departures. Work in flight is estimated between samples. The recent window
-/// aims to cover [`window_items`] departures and an estimated pass through the pipeline, but
-/// stops extending at the larger of [`max_window`] and that pass estimate. It keeps whole ticks,
-/// so it may extend up to one tick further.
-///
-/// The pass estimate is a timing hint: recent residence, capped by the bound once known, or by
-/// [`max_window`] before then. It does not prove that any particular item has finished.
-/// Measurements used to check raises and learn the fastest time can span longer than the
-/// recent window.
-///
-/// The normal residence *bound* is:
-///
-/// ```text
-/// bound = the larger of:  drain_target
-///                         max_slowdown x fastest
-/// ```
-///
-/// *Fastest* is the lowest average residence measured while the gate was nearly full, with
-/// enough departures and at least half successful. It can include hidden queue time; it is
-/// not the fastest individual item's time.
-///
-/// - Until fastest is known, cuts by the bound are suspended and raises use [`drain_target`].
-/// - During a trial, the bound widens in proportion to the raises being tried, by at most
-///   [`growth`] times. Chaining raises does not multiply that allowance again.
-/// - Measurements can lower fastest. To learn an upstream that became slower, fastest can
-///   creep upward by [`fastest_decay`] while the bottleneck waits. That upward adjustment is
-///   suspended during trials, cooldowns, and preparation for a retry.
-///
-/// ## Raising
-///
-/// The limit is multiplied by [`growth`] when the bottleneck waits for input (more than
-/// [`starving_share`] of a tick) while the gate is nearly full (90%), and only if:
-///
-/// - residence is within the bound, except for a retry after a cooldown;
-/// - items succeed: at least one since the last change, and at least half of those leaving
-///   lately;
-/// - the previous raise's settling delay has passed, and there is no cooldown.
-///
-/// During the initial climb, another raise can follow an unfinished trial if recent rates
-/// already show improvement, or if nothing had left before that trial began. After a raise has
-/// been taken back, trials finish one at a time until one helps. A retry never chains raises.
-/// Every limit stays between [`floor`] and [`max`].
-///
-/// ## Checking a raise
-///
-/// A raise helps if it increases the departure rate enough: by at least half the limit's
-/// fractional increase, and by more than estimated noise. For example, doubling the limit
-/// should increase the rate by at least 50%.
-///
-/// Each *trial* keeps measurements from before the raise as its baseline. It first skips as
-/// many departures as were in flight at the raise, including the entire tick that reaches
-/// that count. Items can finish out of order, so this reduces overlap with old work without
-/// proving that all old items have left. The trial then collects its own measurements, which
-/// can extend beyond [`max_window`]. It needs at least [`window_items`] departures and an
-/// observation time at least as long as its measured residence before reaching a verdict:
-///
-/// ```text
-/// raise -> as many leave as were inside -> count what leaves
-///                                              |
-///            left faster, as expected? ------- yes -> helped: keep it
-///                                              | no
-///            clearly too little improvement? - yes -> useless
-///                                              | no
-///            otherwise: inconclusive; keep counting until the trial ends
-/// ```
-///
-/// A retry needs a noise margin beyond the required improvement. It is checked at doubling
-/// observation intervals, rather than on every tick. Other trials use a lower bar to keep the
-/// initial climb responsive. A helpful trial carries its measurements into the next baseline.
-///
-/// A trial times out after eight times the largest of: the expected time for [`window_items`]
-/// departures at the baseline rate, the pass estimate, and [`max_settle`]. If the baseline rate
-/// is zero, [`max_window`] supplies the first estimate. An inconclusive trial can also end
-/// early when its baseline is too noisy to resolve a small gain. More observations after the
-/// raise cannot improve the earlier baseline. Raises made before a pass estimate is available
-/// are provisional and are not judged this way.
-///
-/// When a trial ends without a helpful verdict, a retry is taken back. An ordinary raise is
-/// taken back only if the bottleneck waits and residence exceeds the bound in either the
-/// recent window or the trial's measurements. Otherwise that raise may stay. Taking it back
-/// restores the limit before the latest raise, not before the entire climb. An inconclusive
-/// result is not evidence of a hidden queue.
-///
-/// Noise is estimated from departure totals per tick, treating each tick's departures as one
-/// batch, with a correction learned while raises wait. Changing the units of weighted permits
-/// does not change that estimate when the count settings are scaled too. The estimate is a
-/// heuristic: correlated departures and repeated comparisons can still produce wrong verdicts.
-///
-/// ## After a raise was taken back
-///
-/// After taking a raise back, the policy waits before trying again. At the restored limit it
-/// measures consecutive, nonoverlapping stretches, each with at least [`window_items`]
-/// departures and elapsed time at least as long as measured residence. It compares each
-/// stretch with the accumulated baseline:
-///
-/// ```text
-/// measurement:  1         2       3                4
-/// rate:         usual     same    faster           faster
-///                                 ^ maybe chance   ^ twice in a row: it changed,
-///                                                    raises may try again
-/// ```
-///
-/// Two consecutive stretches must differ in the same direction, by more than estimated noise
-/// and a rate ratio greater than 1.1 (faster or slower). This is treated as a pace change, and a
-/// fresh baseline is collected before retrying. Other stretches add to the baseline and help
-/// estimate the noise.
-///
-/// Even if no change is detected, the cooldown ends after 16 stretches, increased for noisy
-/// paces and doubled for consecutive raises taken back, up to six doublings. An inconclusive
-/// trial whose measured gain met the required increase starts again at the shortest wait:
-/// it needs a better baseline, rather than a longer penalty. [`max_retry`] caps every cooldown
-/// in elapsed sample time, even when nothing leaves.
-///
-/// When the cooldown ends, one *retry* may cross an old residence bound. It still needs a
-/// measured baseline, successful departures, a nearly full gate, and a waiting bottleneck.
-/// Expiry therefore does not guarantee an immediate retry or a recovery deadline. Recovery
-/// needs continuing demand and successful departures at a limit the policy is allowed to use.
-///
-/// ```text
-/// limit     retry          retry                    retry
-///   16 |     +--+           +--+                     +--+
-///    8 |-----+  +-----------+  +---------------------+  +------------->
-///       wait      wait x 2            wait x 4, capped by max_retry
-/// ```
-///
-/// A cut during a cooldown restarts rate measurement at the new limit without restarting the
-/// cooldown clock. A cut to [`floor`] ends the cooldown, unless it is taking a trial raise back.
-///
-/// ## Lowering
-///
-/// When residence exceeds the bound while the bottleneck is busy, the policy cuts the limit to
-/// departure rate × the normal bound, rounded down and kept between [`floor`] and the current
-/// limit. It waits for the estimated time to drain the excess before another cut, at most
-/// [`max_settle`]. Already admitted work continues.
-///
-/// While the bottleneck waits, a long residence could be upstream latency or a hidden queue.
-/// A cut could starve the bottleneck further, so the policy only cuts then to take a raise back
-/// or respond to a stall.
-///
-/// The pipeline is *stuck* if work remains inside, something has left before, and no departures
-/// occur for longer than both [`max_window`] and twice the longest observed gap. If the cut
-/// delay has passed and the bottleneck waits (or no bound is known), the limit drops to
-/// [`floor`]. When this lowers the limit, the recent window and timing estimates are reset.
-///
-/// [`floor`]: DrainBoundedBuilder::floor
-/// [`max`]: DrainBoundedBuilder::max
-/// [`initial`]: DrainBoundedBuilder::initial
-/// [`starving_share`]: DrainBoundedBuilder::starving_share
-/// [`growth`]: DrainBoundedBuilder::growth
-/// [`drain_target`]: DrainBoundedBuilder::drain_target
-/// [`max_slowdown`]: DrainBoundedBuilder::max_slowdown
-/// [`max_settle`]: DrainBoundedBuilder::max_settle
-/// [`max_retry`]: DrainBoundedBuilder::max_retry
-/// [`window_items`]: DrainBoundedBuilder::window_items
-/// [`max_window`]: DrainBoundedBuilder::max_window
-/// [`fastest_decay`]: DrainBoundedBuilder::fastest_decay
+/// [`fastest_decay`] and [`max_settle`]) fine-tune how fast it reacts, and how much it measures
+/// first.
 ///
 /// # Example
 ///
 /// ```
 /// # use std::time::Duration;
 /// # use starve_not::DrainBounded;
-/// // Never below two batches of 16; target about 5 seconds of average residence.
+/// // never below two batches of 16, and aim for items to stay inside about 5 seconds
 /// let policy = DrainBounded::builder().floor(32).drain_target(Duration::from_secs(5)).build();
 /// ```
 ///
@@ -289,23 +180,33 @@ use crate::Sample;
 ///
 /// With the `diagnostics` feature, each decision reports:
 ///
-/// - `completion_rate` and `departure_rate`: items finished, and items leaving (finished or
-///   not), per second;
-/// - `residence`: estimated average seconds inside;
-/// - `fastest`: the learned minimum average residence, in seconds, with upward adjustment
-///   when allowed;
-/// - `bound`: the residence threshold used for this decision, including trial widening;
-/// - `window`: seconds covered by the recent control window, not the trial's measurements;
-/// - `is_starving`: 1 if any probe exceeded [`starving_share`], else 0;
-/// - `is_saturated`: 1 if work in flight was at least 90% of the current limit, else 0;
-/// - `is_raise_useless` and `is_raise_inconclusive`: 1 while the policy holds off raising after
-///   taking back a raise that didn't help, or one whose check couldn't tell, else 0;
-/// - `pace_dispersion`: the learned multiplier for the tick-based noise variance. It starts at
-///   1; larger values require stronger evidence of change and longer waits.
+/// - `completion_rate` and `departure_rate`: items done, and items leaving (done or failed), per
+///   second;
+/// - `residence`, `fastest` and `bound`: as in the [model](#model), in seconds; `bound` includes
+///   a trial's widening;
+/// - `window`: how many seconds the measurements cover;
+/// - `is_starving`: 1 if any probe waited more than [`starving_share`] of the tick, else 0;
+/// - `is_saturated`: 1 if the gate was at least 90% full, else 0;
+/// - `is_raise_useless` and `is_raise_inconclusive`: 1 during a cooldown, after a raise that
+///   didn't help or whose trial couldn't tell, else 0;
+/// - `pace_dispersion`: how much more departures vary than [chance](#checking-raises) from
+///   ticks alone suggests, starting at 1. The larger, the bigger a change must be to count.
 ///
-/// Counts and rates use permit weights for [weighted items](crate::Gate#weighted-items).
-/// Timing values can be infinite before enough data arrives or when no work leaves. The two
-/// raise flags describe cooldowns, not an active trial's verdict.
+/// Counts use weights with [weighted items](crate::Gate#weighted-items). Times are infinite
+/// until known.
+///
+/// [`floor`]: DrainBoundedBuilder::floor
+/// [`max`]: DrainBoundedBuilder::max
+/// [`initial`]: DrainBoundedBuilder::initial
+/// [`drain_target`]: DrainBoundedBuilder::drain_target
+/// [`max_slowdown`]: DrainBoundedBuilder::max_slowdown
+/// [`growth`]: DrainBoundedBuilder::growth
+/// [`window_items`]: DrainBoundedBuilder::window_items
+/// [`max_window`]: DrainBoundedBuilder::max_window
+/// [`starving_share`]: DrainBoundedBuilder::starving_share
+/// [`fastest_decay`]: DrainBoundedBuilder::fastest_decay
+/// [`max_settle`]: DrainBoundedBuilder::max_settle
+/// [`max_retry_interval`]: DrainBoundedBuilder::max_retry_interval
 #[derive(Debug, Clone)]
 pub struct DrainBounded {
     config: Config,
@@ -464,7 +365,7 @@ const MAX_DISPERSION: f64 = 100.0;
 
 /// How many measured stretches raises wait after one was taken back, before a retry even if the
 /// pace stays the same. Each raise taken back in a row doubles it, up to `2^MAX_WAIT_DOUBLINGS`
-/// times; `max_retry` caps it in time.
+/// times; `max_retry_interval` caps it in time.
 const RETRY_STRETCHES: u32 = 16;
 
 /// See [`RETRY_STRETCHES`].
@@ -569,6 +470,7 @@ impl Tally {
     /// Whether this tally is enough to trust its rates and residence. It needs both:
     /// - at least `min_departures` items left, so a few early or late items don't skew it;
     /// - elapsed time reaches estimated average residence, to avoid measuring part of a burst.
+    ///
     /// This checks aggregate turnover, not whether all items present at the start have left.
     fn is_trustworthy(&self, min_departures: u64) -> bool {
         self.departed >= min_departures && self.elapsed.as_secs_f64() >= self.residence()
@@ -654,9 +556,9 @@ impl DrainBounded {
         /// # Panics
         ///
         /// If a setting is out of range: `floor` is 0, `max_slowdown` is below 1, `growth` is 1
-        /// or less, `window_items` is 0, `max_window` or `max_retry` is 0, `starving_share` is
-        /// below 0 or at least 1, or `fastest_decay` is below 1. Such values would quietly keep
-        /// the limit from ever growing, or stick it at the floor.
+        /// or less, `window_items` is 0, `max_window` or `max_retry_interval` is 0,
+        /// `starving_share` is below 0 or at least 1, or `fastest_decay` is below 1. Such values
+        /// would quietly keep the limit from ever growing, or stick it at the floor.
     }))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -665,118 +567,91 @@ impl DrainBounded {
         /// Two batches is a good choice: the bottleneck works on one while the next waits.
         #[builder(default = 1)]
         floor: usize,
-        /// The highest admission limit the policy requests.
+        /// The highest the limit goes.
         ///
-        /// Use this for an explicit budget in items or weighted permits. Unlike the residence
-        /// target, this caps the requested limit directly. If set below [`floor`](Self::floor),
-        /// `floor` is used. Work already admitted continues even after the limit is lowered.
+        /// The bound already keeps the limit down. Set this for a hard cap, such as on memory. If
+        /// below [`floor`](Self::floor), `floor` is used.
         #[builder(default = usize::MAX)]
         max: usize,
-        /// Starting limit, kept between [`floor`](Self::floor) and [`max`](Self::max).
-        /// An unset value starts at `floor`.
+        /// The limit to start with, kept between [`floor`](Self::floor) and [`max`](Self::max).
+        /// Unset, it starts at `floor`.
         initial: Option<usize>,
-        /// Target average time inside the pipeline.
+        /// The residence to aim for: how long items stay inside, on average.
         ///
-        /// The normal bound is the larger of this and [`max_slowdown`](Self::max_slowdown)
-        /// times the fastest measured average residence. When the bottleneck is busy and
-        /// residence exceeds the bound, the policy reduces admission. While it waits for input,
-        /// long residence alone does not trigger a cut: upstream may simply be slow.
-        ///
-        /// For example, a steady departure rate of 50 items per second and a 10-second bound
-        /// correspond to about 500 items in flight. This estimates an average; it does not set
-        /// a deadline for any item or for shutdown.
+        /// While the bottleneck is busy, the limit is cut when residence goes past it. For
+        /// example, with 50 items leaving per second, 10 seconds allows about 500 items inside.
+        /// Lower it for less queued work and quicker shutdowns. Pipelines that are slow by nature
+        /// may take longer: see [`max_slowdown`](Self::max_slowdown).
         #[builder(default = Duration::from_secs(10))]
         drain_target: Duration,
-        /// Multiplier on the fastest measured average residence when setting the bound.
-        /// Must be at least 1.
+        /// How many times its fastest residence an item may take, on average. Must be at least 1.
         ///
-        /// Allows naturally slow pipelines to exceed [`drain_target`](Self::drain_target).
-        /// For example, if average residence is at least 40 seconds and throughput is 5 items
-        /// per second, keeping the bottleneck fed takes about 200 items. A multiplier of 1.5
-        /// gives a 60-second bound, allowing about 300 items at that rate.
-        ///
-        /// A larger allowance can absorb uneven upstream timing, but also allows more queued
-        /// work. Fastest can itself include hidden queue time, so this is not a measurement of
-        /// queue-free latency.
+        /// This lets pipelines that are slow by nature go past
+        /// [`drain_target`](Self::drain_target): if items take 40 seconds at best, 1.5 allows 60.
+        /// The extra is a buffer that keeps the bottleneck fed while upstream speed varies, at
+        /// the cost of more queued work.
         #[builder(default = 1.5)]
         max_slowdown: f64,
-        /// What the limit is multiplied by each time it grows. Must be above 1.
-        /// The result is rounded up and capped by [`max`](Self::max).
+        /// What the limit is multiplied by on each raise, rounded up. Must be above 1.
+        ///
+        /// Larger climbs faster, but overshoots more with each raise.
         #[builder(default = 2.0)]
         growth: f64,
-        /// Minimum departure count for learning fastest, judging a trial, and measuring a
-        /// stretch during a cooldown. Must be at least 1.
+        /// How many items must leave before a measurement is trusted. Must be at least 1.
         ///
-        /// These measurements also need elapsed time at least as long as their estimated
-        /// residence. The recent control window aims for this count too, but may contain fewer
-        /// departures when it reaches its time cap (see [`max_window`](Self::max_window)).
+        /// More smooth out chance, but take longer to collect. Raise checks and cooldowns wait
+        /// for this many even past [`max_window`](Self::max_window).
         ///
-        /// A larger count smooths out unusual departures but takes longer to collect. Trial and
-        /// cooldown measurements can extend beyond `max_window`; trials also have a timeout.
-        ///
-        /// Completed and released permits both count. With [weighted items](crate::Gate#weighted-items),
-        /// this counts permit weight, not independent events: scale it along with `floor`,
-        /// `max`, and `initial` when changing units.
+        /// With [weighted items](crate::Gate#weighted-items), this counts weight: scale it along
+        /// with `floor` and `max` when changing units.
         #[builder(default = 20)]
         window_items: u64,
-        /// Time cap for the recent control window, unless the pass estimate is longer.
-        /// Must be non-zero.
+        /// How far back recent measurements may look. Must be non-zero.
         ///
-        /// The window seeks [`window_items`](Self::window_items) departures and one estimated
-        /// pass. When departures are sparse, it stops extending at the larger of this duration
-        /// and the pass estimate, to avoid relying on increasingly old observations. Whole
-        /// ticks are kept, so the window may extend up to one tick further.
+        /// When items leave slowly, seeing [`window_items`](Self::window_items) leave would take
+        /// old ticks that may no longer reflect the pipeline. This caps how old. If items take
+        /// longer than this to go through, measurements look back that long instead.
         ///
-        /// This does not cap the measurements used for trials, cooldowns, or fastest.
-        ///
-        /// A stall also requires no departures for longer than this duration and twice the
-        /// longest observed gap, with work still inside and at least one earlier departure.
+        /// It also decides when the pipeline is stuck: nothing has left for longer than this,
+        /// and for twice the longest gap seen before.
         #[builder(default = Duration::from_secs(30))]
         max_window: Duration,
-        /// Fraction of a tick a probe may report idle before it counts as starving.
+        /// The share of a tick the bottleneck may wait before it counts as starving. At least 0
+        /// and below 1.
         ///
-        /// At least 0 and below 1. Any probe exceeding this threshold is enough. A little waiting
-        /// is normal when handing over work, so a positive threshold avoids reacting to every gap.
+        /// A little waiting is normal when handing over work. With several probes, any one is
+        /// enough.
         #[builder(default = 0.1)]
         starving_share: f64,
-        /// Factor by which fastest may rise on an eligible tick. Must be at least 1.
+        /// How fast the fastest residence may rise, as a factor per tick. Must be at least 1.
         ///
-        /// Fastest is the lowest measured average residence. To learn an upstream that became
-        /// slower, the policy first multiplies fastest by this factor, then lowers it to the
-        /// current measurement if that is smaller.
+        /// Measurements only lower the fastest time, so after upstream gets slower for good, the
+        /// bound would stay too tight. So on each tick the bottleneck starves, the fastest time is
+        /// first raised by this factor, then lowered to what was measured if that is less. 1
+        /// turns this off. It is per tick, so it depends on the pacer's
+        /// [`tick`](crate::PacerBuilder::tick).
         ///
-        /// This requires a nearly full gate, a waiting bottleneck, and enough mostly successful
-        /// departures. It is suspended during trials, cooldowns, and preparation for a retry:
-        /// a waiting probe alone cannot rule out a hidden queue.
-        ///
-        /// For example, with a factor of 1.05, fastest rises from 20 to 30 seconds in about nine
-        /// eligible ticks if the measurement stays at 30. A factor of 1 disables this upward
-        /// adjustment. The rate is per tick, so changing the tick interval changes its speed.
+        /// Not during a trial or a cooldown, or before a retry: there, a long residence may be a
+        /// queue the probe can't see.
         #[builder(default = 1.05)]
         fastest_decay: f64,
-        /// Cap on the settling delay between changes in the same direction.
+        /// The longest a change may take to show before the limit changes the same way again.
         ///
-        /// After a raise, the delay uses the pass estimate. After a cut, it uses the estimated
-        /// time for the excess work to leave. This setting caps those delays so a slow pipeline
-        /// can still adapt. Trial evidence and retry cooldowns may require a longer wait.
-        ///
-        /// For example, a 30-second cap allows another raise after a two-minute pass estimate
-        /// once 30 seconds have passed, provided the other conditions for raising are met.
-        /// Zero removes the settling delay; it does not disable trial checks or cooldowns.
+        /// After a raise, the new items take about one residence to reach the bottleneck. After
+        /// a cut, the excess items take time to leave. Until then the measurements still reflect
+        /// the old limit, and acting on them would change it twice for one reason. This caps
+        /// that wait, so a slow pipeline still adapts. A raise check may hold the next raise
+        /// longer.
         #[builder(default = Duration::from_secs(30))]
         max_settle: Duration,
-        /// Maximum cooldown after a useless or inconclusive raise is taken back.
-        /// Must be non-zero.
+        /// The longest a [cooldown](DrainBounded#checking-raises) lasts. Must be non-zero.
         ///
-        /// Measured in elapsed sample time, including time with no departures. A detected pace
-        /// change or enough measured stretches can end the cooldown sooner. Once it ends, one
-        /// retry may cross an old residence bound, but a measured baseline, successes, and the
-        /// other conditions for raising are still required.
-        ///
-        /// This caps suppression of a retry, not the total time to recovery. Lower it to revisit
-        /// decisions sooner, at the cost of more experiments and temporary queued work.
+        /// A cooldown, after a raise that didn't help was taken back, usually ends sooner: when
+        /// departures per second change, or after enough measurements. This caps it in time, so
+        /// a raise judged wrongly is tried again in the end. Lower it to retry sooner. Each retry
+        /// that doesn't help queues more items for a while.
         #[builder(default = Duration::from_secs(21_600))]
-        max_retry: Duration,
+        max_retry_interval: Duration,
     ) -> Self {
         assert!(floor > 0, "floor must be at least 1");
         assert!(max_slowdown >= 1.0, "max_slowdown must be at least 1");
@@ -788,7 +663,10 @@ impl DrainBounded {
         assert!(window_items > 0, "window_items must be at least 1");
         assert!(!max_window.is_zero(), "max_window must be non-zero");
         assert!(fastest_decay >= 1.0, "fastest_decay must be at least 1");
-        assert!(!max_retry.is_zero(), "max_retry must be non-zero");
+        assert!(
+            !max_retry_interval.is_zero(),
+            "max_retry_interval must be non-zero"
+        );
         Self {
             config: Config {
                 floor,
@@ -802,7 +680,7 @@ impl DrainBounded {
                 starving_share,
                 fastest_decay,
                 max_settle,
-                max_retry,
+                max_retry_interval,
             },
             window: Window::default(),
             settled: Tally::default(),
@@ -835,10 +713,9 @@ impl DrainBounded {
         self.window.total.completion_rate()
     }
 
-    /// Lowest measured average residence while the gate was nearly full, with upward
-    /// adjustment when allowed by [`fastest_decay`](DrainBoundedBuilder::fastest_decay).
-    /// It can include hidden queue time. `None` until measured, or after a stall lowers the
-    /// limit to the floor and resets the estimate.
+    /// The lowest residence seen while the gate was nearly full (see the
+    /// [model](DrainBounded#model)). `None` until measured, and again after the pipeline got
+    /// stuck.
     pub fn fastest(&self) -> Option<Duration> {
         Duration::try_from_secs_f64(self.fastest).ok()
     }
@@ -1016,9 +893,9 @@ impl Policy for DrainBounded {
                 }
             }
         }
-        // the same pace for long enough, or for `max_retry`: retry anyway, in case the raise was
-        // judged wrongly. A pace that varies more by chance tells less per stretch, so the wait is
-        // longer
+        // the same pace for long enough, or for `max_retry_interval`: retry anyway, in case the
+        // raise was judged wrongly. A pace that varies more by chance tells less per stretch, so
+        // the wait is longer
         let doublings = self
             .taken_back_in_a_row
             .saturating_sub(1)
@@ -1026,7 +903,7 @@ impl Policy for DrainBounded {
         let stretches = (RETRY_STRETCHES << doublings) as f64;
         let stretches = stretches * self.pace_dispersion.value().max(1.0);
         if let Some(waiting) = &self.raise_wait
-            && (waiting.stretches as f64 >= stretches || waiting.elapsed >= c.max_retry)
+            && (waiting.stretches as f64 >= stretches || waiting.elapsed >= c.max_retry_interval)
         {
             self.raise_wait = None;
             self.is_retry_due = true;
@@ -1273,5 +1150,5 @@ struct Config {
     starving_share: f64,
     fastest_decay: f64,
     max_settle: Duration,
-    max_retry: Duration,
+    max_retry_interval: Duration,
 }
