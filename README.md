@@ -7,7 +7,7 @@ and the whole pipeline only goes as fast as it does. So how many items should be
 once?
 
 - **Too few**, and the GPU starves.
-- **Too many**, and memory fills up. On shutdown, it costs a long time for everything
+- **Too many**, and memory fills up. On shutdown, it takes a long time for everything
   already started to finish.
 
 The right number depends on download speed, GPU speed and batch size, and those change while

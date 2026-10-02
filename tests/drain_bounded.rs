@@ -775,6 +775,29 @@ fn useless_raise_is_forgotten_after_a_hang() {
     assert!(after >= 4, "stayed at {after} after the hang");
 }
 
+/// The same, but the raise was taken back to the floor, so the hang doesn't move the limit. Once
+/// upstream is back, the stage behind the bottleneck is gone and upstream is slower, so the pace
+/// at the floor stays the same, but more items would now help. The stall must still end the
+/// wait and the timing must be learned again, as when the limit drops to the floor.
+#[test]
+fn useless_raise_is_forgotten_after_a_hang_at_the_floor() {
+    let pipeline = Pipeline {
+        latency: 8.0..8.0,
+        latency_change: Some((3600.0, 16.0..16.0)),
+        sink_rate: vec![(0.0, 0.5), (3600.0, 1000.0)],
+        hanging: Some(3500.0..3600.0),
+        secs: 6000.0,
+        ..Pipeline::default()
+    };
+    let policy = DrainBounded::builder().floor(8).max(MAX).build();
+    let run = run(&pipeline, policy);
+
+    assert_eq!(run.limit_at(3500.0), 8);
+    // the wait would otherwise run out at about 4800s
+    let end = run.limit_at(4400.0);
+    assert_eq!(end, MAX, "{end} at 4400s");
+}
+
 /// Behind the bottleneck sits a stage that works like clockwork, and it gets 30% faster. Its
 /// pace hardly varies by chance, so the policy must learn that and notice the change: the
 /// useless raise is tried again right away, not only once the wait runs out.

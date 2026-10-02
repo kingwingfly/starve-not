@@ -305,9 +305,9 @@ impl Gate {
 
     /// Stop letting items in.
     ///
-    /// Anyone waiting in [`acquire`](Self::acquire), and anyone calling it later, gets
-    /// [`Closed`]. Items already inside keep their tickets and finish normally. Closing can't be
-    /// undone.
+    /// Anyone waiting in an `acquire` method, and anyone calling one later, gets [`Closed`]
+    /// (the `try_` methods return `None`). Items already inside keep their tickets and finish
+    /// normally. Closing can't be undone.
     pub fn close(&self) {
         self.inner.sem.close();
         self.inner.closed.notify_waiters();

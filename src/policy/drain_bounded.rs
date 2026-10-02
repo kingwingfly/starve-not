@@ -63,7 +63,8 @@ use crate::Sample;
 /// ```
 ///
 /// - *Stuck*: nothing has left for longer than [`max_window`], and for twice the longest gap
-///   seen before. With a busy bottleneck, the cut rule handles it instead.
+///   seen before. A busy bottleneck counts as starving here until the bound is known; after
+///   that, the cut rule handles it.
 /// - *Items succeed*: one was done since the last change, and at least half of those leaving
 ///   lately were.
 /// - Cuts need a busy bottleneck: while it starves, nothing queues in front of it, and a long
@@ -134,7 +135,7 @@ use crate::Sample;
 ///
 /// Shortcuts: raises made before fastest is known aren't checked. While starting up, another
 /// raise may join a trial once departures already rose. A cut ends a trial, and a drop to
-/// [`floor`] ends a cooldown.
+/// [`floor`], or getting stuck there, ends a cooldown.
 ///
 /// *Chance* is how much departures per second vary on their own. It's estimated from how many
 /// items leave each tick, and corrected during cooldowns for pipelines whose items leave in
@@ -1041,9 +1042,27 @@ impl Policy for DrainBounded {
             window
         };
         // 6. Hold the next change until this one shows.
-        if target != limit {
+        // a stall leaves the limit unchanged when it is already at the floor, but the pace it
+        // was measured at no longer holds either
+        if target != limit || is_dropping {
             self.settled = Tally::default();
             self.is_succeeding = false;
+        }
+        // a cut to the floor, or a stall there, ends the wait: there the limit sets the pace, so
+        // it would never change. Not for a raise just taken back to the floor: its wait just began
+        let is_floor_reset =
+            is_dropping || (target < limit && target == c.floor && taken_back.is_none());
+        if is_floor_reset {
+            self.raise_wait = None;
+            self.taken_back_in_a_row = 0;
+            self.is_retry_due = false;
+            // a stall usually means the timing changed: learn it again
+            if is_dropping {
+                self.window = Window::default();
+                self.fastest = f64::INFINITY;
+                self.pass = None;
+                self.is_filled = false;
+            }
         }
         if target > limit {
             // the new items reach the bottleneck, and start leaving, about one pass from now
@@ -1074,22 +1093,8 @@ impl Policy for DrainBounded {
             self.raise_trial = None;
             self.raise_after = None;
             // the pace at the old limit no longer holds: measure it again, still counting toward
-            // the wait's end. Not for a raise just taken back: its wait just began. A cut to the
-            // floor, such as when the pipeline gets stuck, ends the wait instead: there the limit
-            // sets the pace, so it would never change
-            let is_floor_cut = target == c.floor && (is_dropping || taken_back.is_none());
-            if is_floor_cut {
-                self.raise_wait = None;
-                self.taken_back_in_a_row = 0;
-                self.is_retry_due = false;
-                // a stall usually means the timing changed: learn it again
-                if is_dropping {
-                    self.window = Window::default();
-                    self.fastest = f64::INFINITY;
-                    self.pass = None;
-                    self.is_filled = false;
-                }
-            } else if let Some(waiting) = self.raise_wait
+            // the wait's end. Not for a raise just taken back: its wait just began
+            if let Some(waiting) = self.raise_wait
                 && taken_back.is_none()
             {
                 self.raise_wait = Some(RaiseWait {

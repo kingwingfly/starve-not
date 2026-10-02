@@ -2,6 +2,7 @@
 name = "starve-not"
 version = "0.1.0-alpha.5"
 edition = "2024"
+rust-version = "1.95"
 authors = ["Louis <836250617@qq.com>"]
 license = "MIT OR Apache-2.0"
 description = "Adaptive admission control for multi-stage pipelines: keep the bottleneck fed while bounding work in flight"

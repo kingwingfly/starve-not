@@ -6,7 +6,7 @@
 //! 1. **The GPU never starves.** Enough items must be on their way to cover the time downloads
 //!    take, even when downloads suddenly get slower.
 //! 2. **Not too much is on its way.** Every item admitted into the pipeline uses memory, and on
-//!    shutdown it costs time for all of them to finish. That should stay short.
+//!    shutdown it takes time for all of them to finish. That should stay short.
 //!
 //! No single fixed number gets both right, because the right number depends on download speed,
 //! GPU speed and batch size, and those change while the program runs. `starve-not` adjusts the
@@ -51,12 +51,14 @@
 //!     let gate = gate.clone();
 //!     async move {
 //!         for id in 0.. {
-//!             // wait until the gate lets one more item in
+//!             // wait until the gate lets one more item in, then download it alongside the others
 //!             let Ok(ticket) = gate.acquire().await else { break };
-//!             let bytes = download(id).await;
-//!             if tx.send((bytes, ticket)).await.is_err() {
-//!                 break;
-//!             }
+//!             let tx = tx.clone();
+//!             tokio::spawn(async move {
+//!                 let bytes = download(id).await;
+//!                 // if the device has stopped, the ticket drops and its permit goes back
+//!                 let _ = tx.send((bytes, ticket)).await;
+//!             });
 //!         }
 //!     }
 //! });
@@ -113,14 +115,16 @@
 //! for item in items {
 //!     let Ok(ticket) = pipeline.acquire().await else { break };
 //!     let Ok(download_ticket) = downloads.acquire_weighted(item.megabytes).await else { break };
-//!     match download(item.id).await {
-//!         Ok(bytes) => {
-//!             download_ticket.complete();
-//!             // ...send `bytes` and `ticket` on to the device, which completes `ticket`
+//!     tokio::spawn(async move {
+//!         match download(item.id).await {
+//!             Ok(bytes) => {
+//!                 download_ticket.complete();
+//!                 // ...send `bytes` and `ticket` on to the device, which completes `ticket`
+//!             }
+//!             // both go back without counting as done
+//!             Err(_) => drop((download_ticket, ticket)),
 //!         }
-//!         // both go back without counting as done
-//!         Err(_) => drop((download_ticket, ticket)),
-//!     }
+//!     });
 //! }
 //! # }
 //! ```

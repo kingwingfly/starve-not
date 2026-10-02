@@ -92,7 +92,7 @@ impl<P: Policy> Pacer<P> {
     /// [`Sample`]s yourself and call [`Policy::decide`].
     ///
     /// Returns `None` on the first call, which only records a starting point, and when `now`
-    /// equals the previous call's, since no time has passed to judge.
+    /// isn't later than the previous call's, since no time has passed to judge.
     pub fn step(&mut self, now: Instant) -> Option<Decision> {
         let sample = self.sampler.sample(&self.gate, &self.probes, now)?;
         self.gate.resize(self.policy.decide(&sample));

@@ -4,7 +4,7 @@
 //!
 //! | Policy | Needs a probe | Raises the limit when | Lowers it when |
 //! |---|---|---|---|
-//! | [`DrainBounded`] | yes | the bottleneck waits, the gate is nearly full, and items succeed | residence is too high while busy, a trial is taken back, or a stall warrants a cut |
+//! | [`DrainBounded`] | yes | the bottleneck waits, the gate is nearly full, and items succeed | residence is too high while busy, a raise is taken back, or a stall warrants a cut |
 //! | [`Aimd`] | no | ticks go well | items fail or get slow |
 //! | [`Fixed`] | no | never | never |
 
